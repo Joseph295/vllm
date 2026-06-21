@@ -211,6 +211,54 @@ V0 = 遗留实现(legacy)，现在主要作为 fallback：请求了 V1 尚不支
 
 **关键直觉**：draft 的好坏只影响**接受率（即速度）**，不影响输出分布（**正确性由拒绝采样在数学上保证 = target 分布**）。所以"接受率"是投机解码的第一指标；proposer 越重→提议越准→但每步 draft 开销越大，最优点取决于"省下的 target forward × 接受率"能否盖过"draft 固定开销"。
 
+## 重点机制特写：PagedAttention 的 block table 寻址
+
+vLLM 把 OS 的虚拟内存分页搬到 GPU 管 KV cache：每条序列的 KV 切成定长 `block`（页，典型 `block_size=16`），逻辑连续的 block 经 **block table（页表）** 映射到**物理上可不连续、甚至跨序列共享**的物理块——这就是消灭显存碎片、实现前缀共享的物理基础（完整机制见 [模块 02](02-paged-attention-kvcache/design.md)）。
+
+```
+逻辑视角（每条序列连续编号）          block table（每请求一行：逻辑块→物理块）
+  req A: [L0][L1][L2][L3]   ──────►    A: [7, 3, 9, 1]
+  req B: [L0][L1]          ──────►     B: [7, 5]          ← B 的 L0 也指向物理块 7
+            │                                  │              = 与 A 共享前缀（prefix caching）
+            ▼                                  ▼
+物理 KV cache（num_gpu_blocks 个定长块，乱序复用）
+  ┌phys0┐┌phys1┐┌phys2┐┌phys3┐┌…┐┌phys5┐┌…┐┌phys7┐┌…┐┌phys9┐
+  │     ││ A.L3││     ││ A.L1││ ││ B.L1││ ││A.L0 ││ ││ A.L2│   phys7 被 A、B 同时指向
+  └─────┘└─────┘└─────┘└─────┘└─┘└─────┘└─┘│B.L0 ││ │└─────┘
+                                            └─────┘└─┘   ref_cnt=2 → 写时触发 copy-on-write
+
+单个 token 的全局地址：  slot = physical_block_id * block_size + (position % block_size)
+  · 写 KV：reshape_and_cache 按 slot_mapping[token] 写入 cache[slot]
+  · 读 KV：attention kernel 用 block_table[logical] → physical 反查 —— 这是 PagedAttention
+           与朴素 flash-attention 的唯一本质区别：多一次"逻辑块→物理块"的间接寻址。
+```
+
+> 由此，**抢占重分配 / 前缀共享 / copy-on-write 都只是改 block table，不搬数据**。前缀命中靠对 block 的 token 内容做 hash、沿 hash 链查字典实现（命中前缀直接计入 `num_computed_tokens`、跳过计算）。
+
+## 重点机制特写：PD 分离的跨实例 KV 搬运
+
+PD 分离把 **prefill（计算密集）** 与 **decode（访存密集）** 拆到不同实例，prefill 算好的 KV cache 经 connector 跨实例搬到 decode 实例续算，互不干扰（完整三层抽象见 [模块 04](04-pd-disaggregation/design.md)）。**⚠️ 当前 KV 传输仅接入 V0**：设 `--kv-transfer-config` 会使引擎从 V1 回退 V0，且仅支持 1P1D。
+
+```
+   client ──► Proxy：① 复制请求(max_tokens=1) 发 prefill ② 等完成 ③ 原请求发 decode，流式回
+                       │                                    │
+        ┌──────────────▼─────────────┐        ┌────────────▼──────────────────┐
+        │  PREFILL 实例  kv_producer  │        │  DECODE 实例  kv_consumer       │
+        │  execute_model：算 prefill KV│        │  need_recv_kv? → 收 KV 写回本地  │
+        │  按 seq_lens 切请求          │        │  paged cache，bypass 掉 prefill  │
+        │  按 layer×slot 抽 K/V/hidden │        │  forward，用 hidden 直接采样首   │
+        │  buffer.insert(...)         │        │  token，之后正常 decode          │
+        └──────────────┬─────────────┘        └────────────▲──────────────────┘
+                       │ KV cache (按 token×layer 切分)      │
+                       ▼                                     │
+            ┌──────────────── KVPipe ─────────────────────────┘
+            │  signal pipe(CPU 元数据) + data pipe(GPU 张量)
+            │  PyNcclPipe(NCCL) / MooncakePipe(RDMA)，send 非阻塞与计算重叠
+            └─────────────────────────────────────────────────
+```
+
+> 为什么不能用裸 FIFO 管道：decode 实例取 KV 时要按"哪条请求/哪段前缀"**按需查询**，所以中间隔一层 **LookupBuffer**（producer 侧 deque + 后台 `drop_select` 线程）做按内容选取，而非先进先出。
+
 ## 模块依赖关系
 
 ```
