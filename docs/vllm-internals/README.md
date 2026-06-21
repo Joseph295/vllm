@@ -177,6 +177,40 @@ V0 = 遗留实现(legacy)，现在主要作为 fallback：请求了 V1 尚不支
 
 > 一句话串联：**前端把文本变 token [00/10] → 跨进程进 EngineCore [00] → 调度器决定这步算什么 [01]（受 KV[02]/encoder[10]/LoRA[09]/spec[05]/grammar[06] 约束）→ Executor 分布式执行 [03] 跑模型 forward（编译[07]·量化[08]·LoRA[09]·PagedAttention[02]）→ 采样[06]/投机[05] 出 token → 回填检测 stop [01] → 跨进程回前端 detokenize [00/06] → 流式返回**；PD 分离 [04] 则把 prefill 与 decode 拆到不同实例。
 
+## 重点机制特写：投机解码（Speculative Decoding）流程
+
+投机解码是"在调度 + KV + 采样之上叠加 draft/verify"的一步循环，下图是它一步的数据流（完整推导见 [模块 05](05-speculative-decoding/design.md)）：
+
+```
+        ┌─ 上一步 proposer 已为每条请求产出 k 个 draft：req.spec_token_ids = [d1,d2,…,dk]
+        ▼
+  ① 调度  scheduler.schedule()
+        把 k 个 draft 一并纳入 token 预算（一步要算 k+1 个位置）   ...... [01 调度]
+        ▼
+  ② Target 一次 forward（注意：是一次，不是 k+1 次）
+        对 k 个 draft 位置 + 1 个 bonus 位置，算出 target logits p(x)  ...... [00/03 执行]
+        ▼
+  ③ RejectionSampler（Triton）逐位置比较 draft 分布 q 与 target 分布 p
+        ┌───────────────────────────────────────────────────────────────┐
+        │  for i in 1..k:                                                 │
+        │     r ~ U(0,1)                                                  │
+        │     若 r < min(1, p(di)/q(di))  → accept di                     │
+        │     否则 → reject：从修正分布 p'=norm(max(0,p−q)) 重采样 1 个    │
+        │            token，并丢弃 d(i+1..k)（建立在被推翻前缀上）  ──┐    │
+        │  若 1..k 全 accept → 再白送 bonus token（第 k+1 位置）       │    │
+        └────────────────────────────────────────────────────────────┘    │
+        ▼  本步产出 1 ~ k+1 个「严格服从 target 分布 p」的 token  ◀────────┘
+           （最坏=普通 decode 一步；最好=一次前进 k+1）        ...... [06 采样]
+        ▼
+  ④ 回填  update_from_output
+        按"被拒位置"回退 num_computed_tokens（接受 m 个就只认 m 个）  ...... [01 调度]
+        ▼
+  ⑤ 为下一步重新提议 k 个 draft（ngram / eagle / draft model）
+        写回 request.spec_token_ids ──► 回到 ①                       ...... [05 proposer]
+```
+
+**关键直觉**：draft 的好坏只影响**接受率（即速度）**，不影响输出分布（**正确性由拒绝采样在数学上保证 = target 分布**）。所以"接受率"是投机解码的第一指标；proposer 越重→提议越准→但每步 draft 开销越大，最优点取决于"省下的 target forward × 接受率"能否盖过"draft 固定开销"。
+
 ## 模块依赖关系
 
 ```
