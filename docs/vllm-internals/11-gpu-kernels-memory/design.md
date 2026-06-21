@@ -269,3 +269,35 @@ Grid (num_heads, num_seqs, max_num_partitions)
 ```
 
 > 实现层面的逐行调用链、kernel 内的指针算术、向量化访存与 bank conflict 规避、reduce 细节，见同目录 [`impl.md`](impl.md)。
+
+---
+
+## 8. 设计背后的考量与历史教训
+
+### 8.1 设计背后的考量（深化"为什么"）
+
+1. **为什么手写 paged decode kernel、而非复用 cuBLAS/FlashAttention**。decode 的 query 只有 1 个 token（M=1），标准 GEMM 在 tensor core 上大量空转；再叠加 PagedAttention 的"KV 物理不连续、要查 block table 跳读"——现成 GEMM/flash kernel 都不接受这种间接寻址。所以 vLLM 否决了"复用通用 kernel"的路线，改编自 NVIDIA FasterTransformer 的 `decoder_masked_multihead_attention`（见 `.cuh` 文件头注释）手写 `paged_attention_kernel`。代价是维护一大坨模板 CUDA（每个 head_size/block_size 组合单独编译、编译慢二进制大），但这是"既要 paged、又要 decode 高效"无法回避的成本。
+
+2. **V1→V2 split-KV 是被"小 batch + 长序列"的并行度不足倒逼出来的**。最初只有 V1：一个 thread block 串行扫完整条序列的 KV。当 `num_seqs*num_heads` 填不满 GPU 的 SM、序列又很长时，大量 SM 闲置而单 block 串行扫几千 KV。V2 把 KV 沿序列维切成 512-token partition 并行算、再用 online-softmax 的 reduce kernel 合并——本质是把 FlashDecoding 的 split-KV 思想搬到 paged decode。选择走 V1 还是 V2 至今仍是启发式（`paged_attn.py:128`），承认了"没有静态最优解、只能按 batch/seq 规模猜"。
+
+3. **KV 显存为何要真跑 dummy forward 量、而非静态推算**。激活峰值（尤其 prefill 大 batch 的中间张量）无法静态算准，所以 vLLM 的办法是 `profile_run` 真跑一次最大 batch 的 forward 量峰值（`gpu_worker.py:139`）。一个关键且反直觉的点：NCCL 通信 buffer、custom all-reduce 的 IPC buffer **不走 torch allocator**，必须从 `mem_get_info` 与 torch 计数的差值里把这些 non-torch 分配补回峰值，否则会高估可用显存而 OOM（`gpu_worker.py:171-181`）。这条"要数 non-torch 分配"的教训是踩过 OOM 坑后才补上的。
+
+4. **custom all-reduce 用 IPC P2P，是对"NCCL 小消息延迟偏高"的针对性绕行**。decode 时激活很小，NCCL 的通用调度/proto 协商开销盖过实际传输。custom all-reduce 用 `cudaIpcOpenMemHandle` 让各卡直接读写对端显存、自旋 flag 同步，路径极短。但它有强约束（仅 NVLink 全连接 + ≤8 卡 + 偶数卡）、且只用 36 个 block（`custom_all_reduce.cuh:519` 注释：block 太多反而在 NVLink 上争用）——这是"只在特定拓扑下才划算"的专用优化，不是通用替代。
+
+5. **CUDA graph 的"固定地址"约束如何向上反推整个数据通路的设计**。graph 录的是"对某固定显存地址执行某 kernel"，所以 input_ids/positions/slot_mapping/block_table/KV cache 都必须是预分配持久张量，每步 `copy_` 进去再 replay。这条底层约束直接解释了上层为何"block_id 永不变、block table append-only"（[模块 02](../02-paged-attention-kvcache/design.md) §5），也解释了 custom all-reduce 为何要"捕获期占位、replay 前填实际 peer 指针"（`graph_unreg_buffers_`）。一个看似底层的 GPU 约束，反向决定了上层多个模块的数据结构必须 append-only/地址稳定。
+
+### 8.2 重要 bug 修复（真实、精选）
+
+下列 PR 号 / issue 号均经 `git log`/`git show` 或代码注释在本仓库实际核对（注明出处）。
+
+| PR | 问题 | 暴露的设计点 / 教训 |
+|---|---|---|
+| **#16693** [Bugfix][Kernel] fix potential cuda graph broken for merge_attn_states kernel | `merge_attn_states_kernel` 的 launch 宏没显式指定 stream（`<<<grid, block>>>` 用了默认 stream），cascade/split-KV 合并在 CUDA graph 捕获下可能被打断 | 修复改成 `<<<grid, block, 0, stream>>>`。教训：任何要被 CUDA graph 捕获的 kernel launch 都必须显式跑在当前 stream 上，默认 stream 会让 capture 失效——§8.1.5"固定地址/固定 stream"约束在一个不起眼的 launch 宏上被违背 |
+| **#5dba2575** Resolve race conditions in Marlin kernel (#11493) | `gptq_marlin.cu` 存在线程间竞态，多线程对共享数据的读写顺序未正确同步，量化 GEMM 偶发结果错误 | 量化 kernel 把 dequant 融进 GEMM、多线程共享 staging 数据，同步稍有不慎即 data race。教训：dequant-fuse 的高性能 kernel 共享状态密集，正确的 barrier/同步是正确性底线，竞态在大 M 维或特定 occupancy 下才偶发、极难复现 |
+| **#8558** [Bugfix] Fix potentially unsafe custom allreduce synchronization | custom all-reduce 的跨卡自旋同步（`Signal`/barrier）内存序不够安全，可能读到对端尚未写完的数据 | 重写了 128 行同步逻辑。教训：custom all-reduce 跳过 NCCL 自己实现跨卡同步，acquire/release 内存序必须严格正确——P2P 直接读写对端显存时，"对端是否写完"完全靠 flag 同步保证，弱内存序会让 1-stage 读到脏数据 |
+| **#6852** [Bug Fix] Illegal memory access, FP8 Llama 3.1 405b | cutlass w8a8 的 broadcast load epilogue 在 FP8 大模型上越界访存，触发 illegal memory access | 量化 GEMM 的 epilogue（scale 广播）地址算术在特定 shape 下越界。教训：低精度 GEMM 的 scale 广播路径对 shape 边界敏感，405b 这类极端维度最容易把 epilogue 的隐式 shape 假设暴露出来 |
+| **issue #641**（代码注释，`attention_kernels.cuh:424`） | 序列末尾、超出 `seq_len` 的 padding token 对应的 V 向量可能含 NaN，直接参与加权和会污染输出 | kernel 在最后一个 block 显式把越界位置的 `v_vec` 清零（`token_idx + j < seq_len ? v : zero`）。教训：paged attention 按 block 对齐扫描，最后一个 block 几乎总有越界 token，其 KV 是未初始化/脏数据，必须在累加前显式 mask 清零防 NaN——正确性 corner case 直接写进了 kernel 内层循环 |
+
+补充：`gpu_model_runner.py:217` 的 M-RoPE `mrope_positions` 故意多留一个 dummy 位置使其非连续以兼容 torch.compile，注释引用了 `pull/12128#discussion_r1926431923`（已核对存在）——这是"为兼容编译器而刻意让张量非连续"的设计取舍，非 bug，但同属本模块"底层约束反推数据结构"的典型。
+
+无"挖不到 bug"的情况：本模块涉及的 `csrc/**` kernel 与 V1 worker 路径 bug 修复历史丰富。

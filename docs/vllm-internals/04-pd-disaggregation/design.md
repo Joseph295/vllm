@@ -242,3 +242,34 @@ PD 分离不是免费的 —— 它引入了**KV 跨实例搬运的网络开销*
 ```
 
 > 实现层面的逐行调用链、`file:line` 对照与边界情况，见同目录 [`impl.md`](impl.md)。
+
+---
+
+## 8. 设计背后的考量与历史教训
+
+> 本节深化 §5 "权衡取舍"表背后的"为什么"，并从真实 bugfix 里读出教训。**重要前提**：如 §0 / §2 所述，本模块的 KV 传输代码**只接在 V0 worker 上、官方标注 experimental、仅 1P1D**，且 `SimpleConnector` 写死"整批都是 prefill"的假设。这意味着它的 bug 大多集中在 `SimpleConnector` 这一个参考实现的边界条件上——下面的修复列表如实反映了这一点（几乎全部围绕 `simple_connector.py` / `simple_buffer.py`），并非全功能成熟模块的均匀分布。
+
+### 8.1 设计背后的考量（深化"为什么"）
+
+1. **为什么是三层（Connector / LookupBuffer / Pipe）而非一层传输 API**：最朴素的设计是"给我一个 `send_kv(req)` / `recv_kv(req)`"。但 §2 列出的三条约束——可插拔后端、乱序容错、背压——各自落在不同层：**后端可替换**落在 Pipe（NCCL/RDMA/store 各实现一个），**乱序容错**落在 LookupBuffer（把 FIFO 翻译成"按 token 查找"，§3.4），**bypass 决策**落在 Connector（从 paged KV 抽本请求的 KV、决定是否跳过前向）。把它们压成一层会让"换 RDMA 后端"被迫重写乱序逻辑。三层的代价是调用链长（§5 已坦承），但每层只对一个约束负责，且 README 明确允许"下两层旁路"（Redis/RDMA 自带查找时跳过 Pipe，§3.2）。
+
+2. **为什么传输编排放在外置 proxy，而不是让两个 vLLM 实例互相感知**：一个看似自然的设计是让 prefill 实例算完直接"推"给某个 decode 实例。但这会把"哪条请求先 prefill 后 decode、发给哪个 decode 池成员"的调度逻辑塞进 vLLM 核心，并要求实例间维护彼此的在线状态。vLLM 选择**让实例之间互不知道对方**（§3.1 的关键认知），只通过 `kv_ip:kv_port + kv_rank` 建的 stateless process group 对接，时序由外置 proxy 保证。代价是要额外部署 proxy、且当前 1P1D 写死；收益是 vLLM 核心保持简单、两池可各自独立扩缩容（§5 末行）。
+
+3. **为什么 KV 不能"按逻辑 token 顺序"直接传，而要先按 paged slot 抽取再重堆叠**：两个实例的 block 分配**各自独立**——同一条请求在 prefill 实例和 decode 实例占的物理 slot 完全不同。所以发送端必须用本地 `slot_mapping` 从 paged 显存里把本请求这些 token 的 K/V **抽成紧凑张量**再传，接收端再用**自己的** `slot_mapping` `reshape_and_cache` 回本地 paged 显存（§3.3 的非显然点）。这条约束直接解释了为什么传的是"按 slot 抽取后的紧凑张量"而非"整块 paged memory"。
+
+4. **为什么信号管道放 CPU、数据管道放 GPU（一个被注释反复强调的设计）**：producer 在传输 KV 时还要能监听 consumer 的新查询。但 **on-device（GPU）recv 会阻塞进程内所有线程**，使 producer 一边传 KV 就没法监听；而 CPU recv 只阻塞当前线程。于是 `SimpleBuffer` 刻意把**信号管道放 CPU、数据管道放 GPU**（§3.5、`simple_buffer.py:30-39`），用 CPU 信号解耦"监听"与"传输"。这是被"GPU recv 阻塞全进程"这一硬约束倒逼出来的非对称设计。
+
+5. **为什么传 KV 还要捎带 hidden states**：只传 KV 的话，decode 实例还得自己跑一遍 prefill 的最后一层才能拿到第一个 token 的 hidden。捎带 hidden states 让 consumer 能**彻底 bypass prefill 前向**（§3.1、`base.py` 的 `bypass_model_exec`），连首 token 的 hidden 都不用重算。代价是传输量更大（§5），且 `base.py:77` 注释坦承"未来应连 sampler outputs 一起传"——说明这是个仍在演进的取舍点。
+
+### 8.2 重要 bug 修复（真实、精选）
+
+> 下列 PR 均可在本仓库 `git log` 查到。这些修复高度集中在 `SimpleConnector` / `SimpleBuffer`，恰好印证了"参考实现 + 1P1D + 整批 prefill 假设"这套边界条件最易出问题。
+
+| PR | 问题 | 暴露的设计点 / 教训 |
+|---|---|---|
+| **#13987** `patch the inflight batching on the decode node in SimpleConnector to avoid hangs in SimpleBuffer` | decode 节点做 inflight batching 时，batch 里**混进了 decode token**（不全是 prefill），`SimpleConnector` 仍按"全 prefill"逐 `seq_lens` 切，导致与 producer 的 NCCL 传输错位、**SimpleBuffer 挂死** | 直接暴露 §2 / §5 那条"`SimpleConnector` 假设整批都是 prefill"。修复加了 `start_pos >= num_prefill_tokens` 的判断：一旦越界就 `bypass=False` 回退正常前向并告警"应关 chunked prefill"。教训：基于 FIFO+NCCL 的同步传输对"batch 构成"极敏感，假设一旦被打破就是 hang 而非报错 |
+| **#12723** `Fix disagg hang caused by the prefill and decode communication issues` | prefill / decode 间通信时序问题导致整体挂死（围绕 `SimpleBuffer` 的信号/数据管道与锁） | 跨实例同步传输的死锁难复现、难定位。佐证了 §3.5 为何要把信号管道放 CPU、并用 `Condition` 做背压——这套并发结构是 PD 分离正确性的脆弱点 |
+| **#14369** `Add a check in send_kv_caches_and_hidden_states and fix the reshape of the KVCache` | `head_size` 直接用 `hidden_size // num_attention_heads` 算，对带独立 `head_dim` 的模型（如 DeepSeek）**算错**，reshape KV 时形状不对；且缺少对 inflight batching 的越界检查 | §3.3 "按 layer×slot 抽 K/V 再 reshape"依赖正确的 `(num_heads, head_size)`。修复改用 `getattr(model_config, "head_dim", ...)`。教训：KV 形状参数不能从 hidden_size 反推，必须尊重模型自带的 `head_dim` |
+| **#12074** `Fix num_heads value for simple connector when tp enabled` | `num_heads` 直接取 `model_config.num_key_value_heads`，**没除以 tp_size**，TP 开启时每个 worker 只持有 `kv_heads/tp` 份 KV，却按全量 reshape | 跨实例传 KV 时，发送端持有的是**本 TP rank 切分后**的 KV，形状必须按 `num_key_value_heads / tp_size` 算。暴露了"PD 分离 × TP"组合下，每 rank 只传自己那份 KV 的切分契约（§3.3 提到的 PP `start_layer..end_layer` 同理） |
+| **#11058** `Fix value unpack error of simple connector for KVCache transfer` | 原代码从 `kv_cache[0].shape` 解包 `_, _, num_heads, head_size`，依赖 KV cache 张量的特定 4 维布局，布局一变就 unpack 失败 | 不该从 KV cache 张量形状里"猜" `num_heads/head_size`，而应从 `model_config` 显式取。这是 #12074 / #14369 同一处代码连续被修的起点——说明"从张量形状反推语义"是反复出 bug 的设计气味 |
+| **#14367** `Add timeout configuration for the torch.store and add KVTransferConfig.kv_connector_extra_config` | 底层 stateless process group 建连用 `torch.distributed` 的 store，**超时写死**，跨机/慢网络下建连卡住无法配置；且 connector 想加自定义参数无处可放 | 暴露 `KVTransferConfig` 早期把配置项写死的局限。修复加了 `kv_connector_extra_config` 这个开放字典 + `get_from_extra_config`，让"新 connector 需要的额外参数"无需改 config 类即可注入——呼应 §2 "可插拔后端"目标 |

@@ -223,7 +223,36 @@ CUDA graph 一个 size 一张图。服务负载的 batch size 千变万化，不
 
 ---
 
-## 7. 一图速览：piecewise 编译/捕获/重放全景
+## 7. 设计背后的考量与历史教训
+
+### 7.1 设计背后的考量（深化"为什么"）
+
+1. **"piecewise 切图"是 PagedAttention 与 CUDA graph 二者不可调和才被发明的**：理论上最省 launch 的方案是 V0 那样把整个 forward（含 attention）录成一张整图。但 CUDA graph 的铁律（固定 shape + 固定地址 + 无 data-dependent 控制流）与 PagedAttention 的本质（变长序列、block table 动态寻址）直接冲突（§3.2）。否决"整图"后，V1 选择把 attention 实现成 custom op 并登记为 splitting op，按它切开图——让"灵活的 attention 走 eager、可 replay 的静态段录 graph"各得其所。**这不是优化，是约束逼出的架构**：没有 piecewise，就只能在"放弃 cudagraph"和"放弃 paged attention"里二选一。
+
+2. **forward context 这个"全局变量"是被 Dynamo 的限制逼出来的丑陋但必要的设计**：attention 需要 `attn_metadata`（每步都变、不能当 graph 输入的非张量信息），而 Dynamo 又不能把 nn.Module 对象当图输入。否决了"把 metadata 当 forward 参数透传"的干净方案，改用进程内全局 `ForwardContext` + `layer_name → 模块` 反查表（§3.3）。代价是引入隐式全局状态、可读性变差，但这是让 attention op 成为"干净的、可被 Dynamo 识别为切点的 custom op"的唯一办法。
+
+3. **`custom_ops=["none"]`（V1 默认关掉手写 CUDA op）是把"极致单 kernel 性能"让位给"可融合性 + cudagraph 兼容性"**：vLLM 有一批手写 custom CUDA kernel（如 rms_norm+quant 融合）。但 V1 默认关掉它们、交给 Inductor 统一融合（`config.py` 注释明示 piecewise cudagraph 与某些手写 kernel 配合有问题）。这是有意识地放弃局部峰值性能，换整条编译路径的正确性与可组合性。
+
+4. **编译与捕获严格"先 compile 再 capture"、且"从大 size 到小 size"——顺序本身就是正确性约束**：CUDA graph 录的是"实际会跑的那串 kernel"。若没先把段编译好就录，会把未优化的 eager kernel、甚至编译过程本身录进 graph（§3.6）。warmup 同理——要让 cuBLAS/Inductor 的惰性初始化、autotune 在录制前完成。而"大→小"遍历是显存 trick：大 size 的 graph 显存池可被小 size 复用（共享 `global_graph_pool`），反过来则要为每个 size 单独留池。**这些顺序不是风格，是不可颠倒的硬约束**。
+
+5. **整个栈演进的脉络：从 V0 整图，到 torch.compile 集成（`#14437` 解释文档），到 piecewise 落地**：早期 cudagraph 经历过 weak ref / 显存池管理的反复（`#10048` 修 piecewise cudagraph 的 weak ref），inplace buffer 与 cudagraph 的交互也踩过坑（`#11596`）。编译缓存的 hash key 更是反复打磨（`#11614`、`#14953`、`#15494`）——因为 key 必须正确反映"所有影响图的因素"（env、config、traced 代码、compiler hash），否则二次启动会 load 到 stale 缓存，出现极难调试的"图不对"。
+
+6. **`enforce_eager` 是一等公民逃生口，而非调试残留**：编译有几十秒到分钟级的时间成本、占显存、偶发 Inductor bug，超长序列和不支持的硬件也可能不兼容。所以从一开始就设计了一键退回纯 eager 的开关（§3.8），让 PIECEWISE 分支、cudagraph、装饰器编译全部跳过。**承认"编译路径会出问题"并预留确定性兜底，是务实工程，而不是不自信**。
+
+### 7.2 重要 bug 修复（真实、精选）
+
+| PR | 问题 | 暴露的设计点 / 教训 |
+|---|---|---|
+| `#11596` | cudagraph 与 inplace buffer assignment 交互出错（如 rotary embedding 原地写 buffer） | CUDA graph replay 依赖"输入住在固定地址"，forward 中原地改写 nn.Module buffer 会破坏这个前提。教训：持久 buffer + 固定地址既是性能优化、**又是 cudagraph 的硬前提**，任何 inplace 写入都要审视是否违约 |
+| `#10048` | piecewise cudagraph 的 weak ref 处理有 bug | CUDA graph 显存池 / 子图对象的生命周期管理极易踩 weak ref 坑。教训：graph 捕获涉及跨 Python/C++ 的对象持有，引用计数要显式管，不能依赖 GC 时机 |
+| `#10170` | `SymIntArrayRef expected to contain concrete integers`——Dynamo 符号 shape 在某处被当成 concrete int 用 | 用 `mark_dynamic` 把 batch/token 维标成符号 shape 后，所有下游代码都要能处理 SymInt。教训：动态符号 shape 不是免费的，凡假设 shape 是 Python int 的代码都可能炸 |
+| `#12191` | `sym_tensor_indices` 处理不当 | 同源问题：符号化 shape 与张量索引交互的边界情况。教训：torch.compile 的符号 shape 会渗透到看似无关的索引逻辑，切图 backend 必须显式处理 |
+| `#10902` | RMSNorm + quant 融合在 non-cutlass-fp8 情形下出错；顺带把 `RedundantReshapesPass` 重命名为 `NoopEliminationPass` | 自定义 Inductor fusion pass 的覆盖面必须穷举各量化分支，否则某条路径融合出错。教训：编译期的图改写 pass 是"全局重写"，一个 case 没覆盖就静默改坏数值 |
+| `#14953` / `#15494` | 编译缓存 hash 没考虑相关 env vars（`#14953`）；缓存里文件名不对（`#15494`） | 磁盘编译缓存的 key 必须反映所有影响产物的输入。教训：缓存正确性 = key 完整性；漏掉任一影响因子（env/文件名）就会 load 到 stale 产物，且症状离奇难查 |
+
+---
+
+## 8. 一图速览：piecewise 编译/捕获/重放全景
 
 ```
 启动期（一次性）                                       运行期（每步 decode）

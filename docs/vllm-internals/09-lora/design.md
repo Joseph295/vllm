@@ -197,3 +197,32 @@ GPU 上只有 `max_loras` 个激活槽位。如果调度器把"用了 `max_loras
 ```
 
 > 实现层面的逐行调用链、`file:line` 对照、精妙之处与边界情况，见同目录 [`impl.md`](impl.md)。
+
+---
+
+## 8. 设计背后的考量与历史教训
+
+### 8.1 设计背后的考量（深化"为什么"）
+
+1. **为什么坚持"运行时算 BA、不 merge 进 W"——这是多租户的地基，不是一个性能选项**。理论上把 `ΔW=BA·s` merge 进 `W` 能让前向退化成单次 GEMM、零额外 kernel。但 merge 一旦发生，每个请求的 `W` 就各不相同，基座再也无法在 batch 内共享——这恰好砸掉了 §1 那个"100 个 LoRA 共享一份基座"的全部价值。所以 vLLM 在架构层面**否决了 merge 方案**，宁可每个被适配层多付 shrink+expand 两次小 kernel，换取"基座大 GEMM 全 batch 只算一遍"。这条约束反过来倒逼出 Punica 分段 kernel：既然不能 merge，就必须有办法在一个混合 batch 里一次算完所有 LoRA 的增量。
+
+2. **kernel 的演进：从 SGMV/BGMV 双套到统一 Triton，再到 V1 全面收敛**。最早 vLLM 沿用 Punica 的两套 CUDA kernel——prefill 用 SGMV、decode 用 BGMV（`punica_base.py` 文件头引用 arXiv:2310.18547）。V1 重写时（#13096 *Add triton kernels for V1*）引入统一的 Triton `lora_shrink`/`lora_expand`，prefill 与 decode **共用同一套 kernel**（`lora_model_runner_mixin.py:65-68` 注释明示），最终在 #14685 *Retire SGMV and BGMV Kernels* 把老的手写 CUDA kernel 整体退役。这条脉络的动机是：维护两套 + 两种平台的手写 kernel 成本过高，而 Triton 让"按 active_lora_ids 维并行"的同一份逻辑覆盖所有场景，可读性与可移植性都更好。
+
+3. **为什么 GPU 权重要 stacked 静态预分配——被 CUDA graph 的固定地址约束倒逼**。`lora_a_stacked` 一开始就按 `[max_loras, 1, max_rank, in]` 全零分配，激活只是往某个 slot `copy_`，从不动态分配显存。这并非单纯为了省事：V1 用 CUDA graph 捕获 forward（#14626 *Enable CUDAGraphs for V1*），而 graph replay 要求所有 buffer 地址恒定。若 LoRA 权重随激活/驱逐动态分配，地址就会漂移、graph 失效。于是"显存恒定可预测"这个收益其实是"必须兼容 CUDA graph"这个硬约束的副产品——代价是即便实际 rank 小、LoRA 少也按上限占显存。
+
+4. **把 max_loras 约束前移到调度层，是"激活永不失败"的设计选择**。GPU 只有 `max_loras` 个槽位，理论上可以让 worker 在激活失败时回退/排队，但那会让错误处理散落在执行热路径上。vLLM 选择让调度器（`scheduler.py:262-302`）在组 batch 时就维护 `scheduled_loras` 集合、主动跳过会超容量的请求——把"容量约束"变成"调度不变式"，使送到 worker 的 batch **永远不会**触发"No free lora slots"。代价是高 LoRA 多样性负载下请求要排队（公平性 vs 容量），但换来了执行层的简单与确定性。
+
+5. **"全 batch 无 LoRA 时早退"为何要靠 CPU flag 而非 Python 分支**。一个 batch 可能完全没有请求用 LoRA。最自然的写法是 Python 侧 `if no_lora: skip`，但这会让 forward 产生两条不同的代码路径、破坏 CUDA graph 的固定结构。#15152 *Skip LoRA kernels when not required* 的做法是引入 `no_lora_flag_cpu` 这个 CPU tensor，让 torch op **在 kernel 内部早退**而不改变图结构——这是"既要省掉无谓 kernel、又不能破坏 torch.compile 图"这对矛盾倒逼出的折中（见 impl T 节）。
+
+### 8.2 重要 bug 修复（真实、精选）
+
+下列 PR 号均经 `git log`/`git show` 在本仓库实际历史中核对。
+
+| PR | 问题 | 暴露的设计点 / 教训 |
+|---|---|---|
+| **#16040** [Bugfix] LoRA: Fix the order in which the kernels process LoRAs | `lora_kernel_metadata.py:113` 构造 `active_lora_ids` 时用 `torch.unique(..., sorted=False)`，导致 kernel 处理 LoRA 的段顺序与元数据假设不一致 | 一行 `sorted=False → sorted=True` 的修复。教训：分段 kernel 的正确性高度依赖"段元数据与 token 排序顺序严格一致"这一隐式契约；`token_indices_sorted_by_lora_ids` 与 `active_lora_ids` 必须按同一个 key 排序，任何一处用 unsorted 都会错位 |
+| **#11708** [Bugfix] Fix ColumnParallelLinearWithLoRA slice | TP 下切分 `lora_b` / bias 时误用 `self.output_dim` 作 `shard_size`，应为 `self.output_size`，导致每个 rank 切到错误的权重分片 | LoRA 是叠在已并行化的基座层上的"横切层"，必须复用基座层的分片语义；`output_dim`/`output_size` 一字之差就让 TP 分片错位。教训：LoRA 层的分片逻辑不能自创，要和基座 ColumnParallel 的语义严格对齐 |
+| **#11727** [Bugfix] Validate lora adapters to avoid crashing server | 非法/不兼容的适配器（rank 超限、含不支持的字段）能一路加载到 worker 才抛错，直接拖垮整个 server | 催生了 `PEFTHelper._validate_features`（校验 DoRA/modules_to_save 等）这层前置校验。教训：动态加载用户提供的适配器是攻击面，校验必须前移到加载入口，不能让坏适配器进到执行热路径 |
+| **#14508** [V1][Core] Fix memory issue with logits & sampling | logits/sampling 的显存占用未被正确计入，与 LoRA 的 `lora_model_runner_mixin` 路径相互作用导致显存核算偏差 | 该修复同时改了 `gpu_worker.py` / `gpu_model_runner.py` / `lora_model_runner_mixin.py`。教训：LoRA 作为横切关注点叠在显存 profiling 之上，任何对激活峰值的改动都要连带复核 LoRA 路径的显存账（这条 PR 此前还被 revert 过两次，见 #13775/#14504，说明显存核算的边界极易踩坑）|
+
+无"挖不到 bug"的情况：本模块代码路径的 bug 修复历史非常丰富。

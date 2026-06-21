@@ -222,3 +222,31 @@ attention kernel 读 KV（逻辑→物理）：
 ```
 
 > 实现层面的逐行调用链、`file:line` 对照、kernel 内的指针算术与边界情况，见同目录 [`impl.md`](impl.md)。
+
+---
+
+## 8. 设计背后的考量与历史教训
+
+### 8.1 设计背后的考量（动机与历史）
+
+1. **V1 把 V0 的"对象层级 block allocator"压扁，否决了"继续封装"的路线**。V0 的 `block/` 目录是一套层层包装（block allocator → block → block table → 独立 `LRUEvictor`），分配一个 block 要穿过多层 Python 调用，prefix caching、CoW、swap 各有独立子系统。V1 把它压成"一个 `BlockPool` + 一条双向链表 `FreeKVCacheBlockQueue` + 一张 hash 字典"，**把驱逐折叠进链表本身**（链表头即 LRU 目标，free 时反序入队），不再需要单独 evictor。代价是放弃 V0 的运行中 block 去重与 CPU swap，换来热路径更短、未命中开销趋零——这正是"zero-overhead prefix caching"的实现基础。
+
+2. **`num_computed_tokens` 必须是 block_size 整数倍，是被刻意立成不变量的"简化记账"**。`allocate_slots` 全程假设这一点，因此 prefix 全命中导致"无新 token"时，宁可回退一整个 block 重算（见 §8.2 `#11186`），也不破坏不变量。这是"用一点冗余计算换记账简单性"的典型取舍——把复杂度挡在数据结构之外。
+
+3. **"ref_cnt 归零不立即销毁、而是当驱逐候选"是为了把复用率压到最大**。归零的 cached block 仍留在 `cached_block_hash_to_block` 里、同时挂进空闲链表，只有被 `get_new_blocks` 真正取走时才 `_maybe_evict_cached_block` 抹掉 hash（软驱逐）。否决的简单方案是"归零即删"，但那会让"刚释放就来的相同前缀"白白错过命中。代价是逻辑更绕、字典占用更久。
+
+4. **prefix caching 的 hash 链经历了从"裸 Python hash"到"抗碰撞 + extra_keys"的演进**。最初只对 token 串做 hash；后续意识到①不同请求 token 串相同但上下文不同会错误命中，②Python `hash` 有碰撞风险。于是 `#12603` 把 `mm_hash`/`lora_id` 等作为 **extra_keys** 混进 block hash，`#12621` 引入更强的碰撞规避（并默认可选 SHA256），`BlockHashType` 还把 `token_ids` 一并存进 key 做双保险。教训：**内容寻址的缓存，"键设计"就是正确性本身**，少一个维度就是一类静默错误。
+
+5. **CUDA kernel 这一层"以重构/演进为主，但有几个高启发的早期正确性 bug"**。PagedAttention kernel 与朴素 attention 的唯一本质区别是多一次 `block_table[logical]→physical` 间接寻址，而恰恰是这层间接寻址 + 块尾不满，制造了最经典的几类 GPU bug：整数溢出、块边界越界、块尾 NaN（见 §8.2）。这些不是设计缺陷，而是"分页"这一抽象在 kernel 落地时必然要补的边界处理。
+
+### 8.2 重要 bug 修复（真实、精选）
+
+| PR | 问题 | 暴露的设计点 / 教训 |
+|---|---|---|
+| `#11186` | prompt 长度恰为 block_size 整数倍且 prefix 全命中时无新 token 可算 | 坐实 **`num_computed_tokens` 必须是 block_size 整数倍**这条不变量：修复回退**整个 block**（`-= block_size`）重算，注释明言"因为 `allocate_slots()` 假设它总是 block_size 的倍数" |
+| `#11565` | `allocate_slots` 里 `_touch(computed_blocks)` 调用位置不当：在确认能分配新块**之前**就 touch 了命中块 | 若随后因空闲块不足分配失败，已被 touch 的 computed block 状态被污染。修复把 `_touch` **移到分配检查之后**——"先确认成功再改共享状态"，否则失败路径会留下脏引用计数 |
+| `#14073` | 重复缓存"已在 prefix cache 里的 block"，靠脆弱的"找第一个未缓存块"循环兜底（代码里原本带 `FIXME: 这本不该发生`） | 缓存写入路径应**只缓存不在 prefix cache 中的 block**，由 `num_cached_blocks` 精确界定，而非靠遍历探测。教训：用 `FIXME` 标注的"理论上不会发生"往往真的会发生，应从源头修而非加兜底 |
+| `#12603` | 两个 token 串相同但 `extra_keys`（如多模态/LoRA）不同的 block 算出同一 hash → 错误命中 | prefix cache 的命中键必须涵盖一切影响 KV 内容的上下文；把 `extra_keys` 混入 block hash。内容寻址缓存的"键完备性"即正确性 |
+| `#1514` | attention/cache kernel 中 `physical_block_number` 用 int32，乘以大 `kv_block_stride` 时**整数溢出** | 分页的间接寻址在大模型/长上下文下，物理块号 × stride 会超出 int32；修复统一 cast 到 int64。教训：地址算术必须按最坏规模选位宽 |
+| `#936` / `#1241` | 块尾不满时 V 向量含越界 token → **NaN**；`#936` 修复时写出 `j <= V_VEC_SIZE` 的 off-by-one，`#1241` 再改回 `j < V_VEC_SIZE` | "块尾不满"是分页抽象的固有边界：最后一个 block 几乎总是半满，越界元素必须显式清零。同一处边界被改了两次，正说明 kernel 边界条件极易写错、需测试守住 |
+| `#16693` | `merge_attn_states` kernel 可能破坏 CUDA graph 捕获 | cascade/分块 attention 合并多段结果时的 kernel 与 CUDA graph 的兼容性边界；说明 KV 复用类优化下放到 kernel 后，要额外守住 graph capture 的约束 |

@@ -177,3 +177,33 @@ decoder 的输入嵌入是一张 `(num_tokens, hidden)` 的张量。多模态路
 ```
 
 > 实现层面的逐行调用链、`file:line` 对照与边界情况，见同目录 [`impl.md`](impl.md)。
+
+---
+
+## 7. 设计背后的考量与历史教训
+
+### 7.1 设计背后的考量（深化"为什么"）
+
+1. **为什么把"占位符长度"立为唯一真相、而非让模型代码自己对齐**。多模态最容易错的地方就是"encoder 输出条数 ≠ 占位 token 数"，一旦错位 KV 全偏、结果静默错误。vLLM 否决了"每个模型自己 tokenize + 自己插占位符"的分散方案，改用 merged processor（`processing.py:1055`）把 tokenize 与占位符展开**合并到同一处**，让 `PlaceholderRange.length == encoder 输出条数`这个不变式有**单一保证点**。代价是 processor 逻辑复杂、每个新模型要写 `_get_prompt_updates`，但换来"对齐错误只可能发生在一个地方"。
+
+2. **encoder cache 为何按 token 数计账、且当前只在请求内复用**。encoder 是重计算且在 chunked prefill 下横跨多步，所以必须把 encoder 与 decoder 计算解耦、缓存 encoder 输出。设计上**有意先不做跨请求的视觉 token 共享**：`encoder_cache_manager.py:96` 注释明确说"目前 compute 和 space 共用同一份 budget，等做了跨请求 embedding 缓存再拆开"。这是一个刻意的"先简单后复杂"演进决策——跨请求复用暂由 prefix caching 在 token 层面间接覆盖（mm_hash 进 token hash），避免过早引入跨请求生命周期管理的复杂度。
+
+3. **双约束截断 chunk：正确性优先于吞吐的硬选择**。一个 mm item 的 encoder 多为双向注意力，**必须整块算**，不能像 decoder 那样部分 chunk。于是 `_try_schedule_encoder_inputs`（`scheduler.py:489`）遇到放不下的 mm item 时，宁可把本步 decoder token 截断到该 item 之前，也绝不部分计算。这是"encoder 把 chunk 边界往前推"的根因——一个被否决的替代方案是"允许 encoder 跨步续算"，但那会破坏双向注意力的正确性，所以被放弃。这个演进还派生出 #14361 把 encoder profiling 与 decoder profiling **解耦**，避免大图把显存峰值算爆。
+
+4. **大像素张量"只过界一次"——P0/P1 镜像缓存的动机**。pixel values 动辄几 MB，若每条请求都 msgpack 过 ZMQ，IPC 直接成瓶颈。`MirroredProcessingCache`（`mm_input_cache.py:33`）让 P0/P1 各持一份按 `mm_hash` 索引的镜像缓存，命中后只把 hash 过界、后端凭 hash 还原张量。这要求两侧缓存**严格同容量同步**——后面 §7.2 的 #16273 正是这条约束没守住时暴露的 bug。
+
+5. **多模态恒用 embedding 输入：为统一处理付出 CUDA graph 的代价**。V1 让多模态模型的 decoder 输入恒为 `inputs_embeds`（连纯文本步也是，`gpu_model_runner.py:1022` 注释），这样"文本 token embedding"与"视觉 soft token"能在同一张量里拼接、attention 一视同仁。代价是 embedding 层被排除出 CUDA graph、纯文本步也略慢——这是"统一数据通路"压倒"逐步最优性能"的取舍。
+
+### 7.2 重要 bug 修复（真实、精选）
+
+下列 PR 号均经 `git log`/`git show` 在本仓库实际历史中核对。
+
+| PR | 问题 | 暴露的设计点 / 教训 |
+|---|---|---|
+| **#13173** [V1][Bugfix] Copy encoder input ids to fix set iteration issue during VLM abort | `EncoderCacheManager.free` 直接遍历 `get_cached_input_ids(request)` 返回的 set，又在循环里 `free_encoder_input` 修改它——"迭代时改集合"在 VLM abort 路径上崩溃 | 一行 `.copy()` 修复。教训：缓存簿记的"释放"操作会原地改动正在迭代的容器，abort（异常路径）最容易把这类隐患引爆；释放语义要对快照迭代 |
+| **#12545** [V1][BugFix] Free encoder cache for aborted requests | 请求被 abort 时，它占用的 encoder cache slot 没被回收，长期跑会泄漏 encoder 缓存空间 | encoder cache 以 token 数为硬容量，任何不回收的路径都会让 `num_free_slots` 单调减少直至无法调度新 mm item。教训：cache 的生命周期必须覆盖**所有**终止路径（正常完成 + abort），不能只在 happy path 释放 |
+| **#16273** [Bugfix] Avoid transferring cached multi-modal items from P0 to P1 | 已被 P0 缓存命中的 mm item，本应只把 hash 过界，却仍把大张量传给了 P1——镜像缓存"只过界一次"的承诺被违背 | 直接命中 §7.1.4 那条"P0/P1 严格同步"约束。教训：镜像缓存的正确性依赖两侧对"命中即不传张量"的判断完全一致，任一侧判断偏差就退化成每次都过界、IPC 带宽白白浪费 |
+| **#12259** [V1][Bugfix] Fix data item ordering in mixed-modality inference | 混合模态（同一 batch 同时有 image+audio 等）推理时，mm 数据项的顺序被打乱，导致 embedding scatter 到错误位置 | mm item 必须按 `offset` 排序后再 scatter（催生 `merge_and_sort_multimodal_metadata`）。教训：当一个序列里有多模态、多 item 时，"占位段在序列中的物理顺序"是 scatter 正确性的前提，不能假设输入顺序即序列顺序 |
+| **#16593** [Bugfix] Multi-modal caches not acting like LRU caches | `mm_input_cache` 用的缓存实现并非真正的 LRU，命中不更新访问顺序，热项可能被误驱逐 | 修复触及 `vllm/utils.py` 的 LRUCache 实现本身。教训："缓存"和"LRU 缓存"不是一回事——若命中时不刷新顺序，缓存退化为 FIFO，多模态大张量的命中率会显著下降 |
+
+无"挖不到 bug"的情况：本模块（含 `encoder_cache_manager.py` / `mm_input_cache.py`）的 bug 修复历史相当丰富。

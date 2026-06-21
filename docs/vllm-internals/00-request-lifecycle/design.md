@@ -174,3 +174,30 @@ engine_core_outputs = self.scheduler.update_from_output(scheduler_output, output
 - **可扩展性**：DP（数据并行）通过多个 `DPEngineCoreProc` 实现（`core.py:558`），PP 通过 batch queue 异步化以消除流水线气泡（`core.py:212`），都建立在同一套 step 抽象上。**注意**：V1 的多进程 `MultiprocExecutor` 目前断言 `world_size == tensor_parallel_size`，即多进程后端尚不支持 PP；V1 下的 PP 需经 Ray Executor（详见 [模块 03](../03-distributed-parallel/design.md)）。
 
 > 实现层面的逐行调用链、`file:line` 对照与边界情况，见同目录 [`impl.md`](impl.md)。
+
+---
+
+## 7. 设计背后的考量与历史教训
+
+### 7.1 设计背后的考量（动机与历史）
+
+1. **"独立 EngineCore 进程"否决了"单进程多线程"和"协程化引擎"两条路**。最自然的省事方案是把引擎仍留在 API server 进程，靠线程池或 asyncio 把 CPU 后处理挪开。但只要还在同一个进程，GIL 就让 tokenize/detokenize/序列化和 GPU 调度抢同一把锁，高并发下周期性卡顿无法根除。V1 最终选择**进程级隔离 + ZMQ/msgpack**，宁可多一次 IPC 拷贝，也要让 GPU busy loop 独占一个纯同步进程、没有事件循环抖动。这是"用确定性换灵活性"的典型取舍——也是为什么 EngineCore 内部反而**不用** asyncio，而退回最朴素的 `while True: step()` 加两个 IO 线程。
+
+2. **"单一后台 output_handler 多路复用"是被 N 协程惊群逼出来的**。早期实现倾向于每条请求各开一个轮询协程直接 await EngineCore，但在上千并发下，N 个协程各自唤醒、各自反序列化会造成严重的任务切换开销与延迟长尾。`#15156`（*Simpler request output queues*）把它收敛成"1 个拉取循环 + 每请求一个 `RequestOutputCollector` 队列"，并在切片之间 `await asyncio.sleep(0)` 主动让出——本质是把"多消费者直连"改成"单生产者扇出"，用集中调度换可控延迟。
+
+3. **shutdown / 错误传播被反复打磨，因为"进程拆分"把容错变成了一等问题**。一旦前后端跨进程，任意一端崩溃、ZMQ context 卡在 `term()`、worker 启动即失败等都会变成挂死或难懂的 traceback。`#13298`、`#13869`、`#16137`、`#15367` 这一串提交把"显式关闭 socket→先停 EngineCore→再 term context""启动期失败要让父进程干净退出""把 model_executor 放进后台进程后补全相关 RPC"逐一补齐。教训是：**进程化带来的吞吐收益，必须用同等投入的生命周期/容错代码来兑现**，否则隔离反而制造新的挂死面。
+
+4. **统一 `num_computed_tokens` 推进抽象是为"让一套编排覆盖所有推理模式"而设**。否决的替代是"为 prefill / decode / spec / prefix-cache 各写一条流水线分支"。代价是正确性高度押注在记账上——任何一处少加/多加 token 都会变成静默错误（详见模块 01 的乐观推进回退），但换来的是 chunked prefill、prefix caching、投机解码共用同一段 step 逻辑。
+
+5. **演进脉络：从"单体 LLMEngine"到"可水平复制的 EngineCore 群"**。`#9826`（AsyncLLM 雏形）→ `#9856`（多进程 TP）→ `#13923`（AsyncLLM 数据并行）→ `#15906`（输入队列改用 ZMQ ROUTER/DEALER 为 DP scale-out 铺路）这条线说明：进程模型一旦拆对，DP 就退化为"把 EngineCore + 其 Worker 群整组复制 N 份、前端按 identity 寻址"，几乎不动核心 step 逻辑。这正是当初坚持进程隔离的长期回报。
+
+### 7.2 重要 bug 修复（真实、精选）
+
+| PR | 问题 | 暴露的设计点 / 教训 |
+|---|---|---|
+| `#15043` | 重复 `request_id` 导致 EngineCore 崩溃 | 跨进程加请求时，前端无法保证 id 全局唯一；引擎核心必须对"脏输入"鲁棒。修复方向是**去掉 step() 里对 `total_num_scheduled_tokens==0` 的特判 early-return**，让重复 id 的请求走正常清理路径而非触发不变量崩溃 |
+| `#14512` | 并行采样（`n>1`）的 finish/abort 记账错乱 | `n>1` 在前端被拆成多个子请求再聚合，父子生命周期与 abort 传播是 OutputProcessor 的薄弱点；说明"per-request 输出队列"抽象在 fan-out 场景下需要额外的聚合层（`parallel_sampling.py`） |
+| `#13298` / `#13869` | EngineCoreClient 关停时 ZMQ `context.term()` 挂死 | `context.destroy()` 名义上会关 socket，实际必须**显式先关 socket、再 term**，否则卡死。进程化的代价：关停顺序成为正确性的一部分 |
+| `#16137` | EngineCore 启动期失败时父进程不退出、空等 | 后台进程的**启动失败**必须显式上报前端并触发干净退出，否则表现为静默挂起——拆进程后"失败也要能传回来" |
+| `#15367` | 把 `model_executor` 放进后台进程后，依赖它的功能（如 sharded state 存取）失效 | 进程边界把"原本同进程可直接调用的对象"切断了，需要补 `collective_rpc` 一类的过界通道——重构进程模型时要系统排查所有跨界调用 |
+| `#9629` | 请求 abort 后资源未清理 | 客户端断连/提前取消是常态而非异常；EngineCore 必须把 abort 当一等事件，主动清 `Request` 状态与缓存，否则泄漏累积 |

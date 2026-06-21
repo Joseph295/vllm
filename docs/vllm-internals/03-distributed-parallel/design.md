@@ -238,3 +238,36 @@ all_ranks = torch.arange(world_size).reshape(
 ```
 
 > 逐行调用链、`file:line` 对照、实现精妙之处与边界情况，见同目录 [`impl.md`](impl.md)。
+
+---
+
+## 9. 设计背后的考量与历史教训
+
+> 本节比 §6 的"权衡取舍"表更进一步：挖掘**为什么是现在这个设计**（否决了什么、被什么约束倒逼、随哪些重构演进），以及从真实 bugfix 里读出的设计教训。所有 PR 号均来自本仓库 `git log` 真实记录。
+
+### 9.1 设计背后的考量（深化"为什么"）
+
+1. **为什么不直接用裸 `torch.distributed`，而要包一层 `GroupCoordinator`**：裸 `ProcessGroup` 只有"一个 group 一种 backend"的概念，但 vLLM 需要在**同一个逻辑组**里同时跑 GPU tensor（NCCL）和 CPU metadata/object（gloo），还要在小消息上换成 custom all-reduce、在 CUDA graph 内换成 pynccl。于是 `GroupCoordinator` 把"device_group + cpu_group + device_communicator + 可选 mq_broadcaster"绑成一个门面对象（§4.1）。代价是多一层抽象，但换来了"按消息大小/拓扑/是否在编译图内择优"的自由——这正是 §4.2 三级回退能存在的前提。注释里"NCCL barrier terrible"那句（`:673-680`）是这一选择的活证据：连最简单的 barrier 都刻意绕开 NCCL 走 CPU group。
+
+2. **`world` 拓扑为什么演进成四维 `ExternalDP × DP × PP × TP`**：早期 reshape 只有 `DP × PP × TP` 三维，用一个 `has_external_dp` 布尔 + "world_size 对不上就当外部 DP"的启发式来兼容 verl 这类 RL 训练集成（外部框架自己复制实例、各 rank 独立 generate）。**#15355（`[distributed] fix dp group`）把这个易错的启发式删掉**，改成显式的第四维 `ExternalDP`（reshape 第一维从 `data_parallel_size` 变成 `-1`），并在注释里钉死两类 DP 的根本区别：**内部 DP 必须同步 generate（否则隐含集合通信死锁），ExternalDP 各 rank 完全独立**（§4.4）。这条演进说明：当"用一个 flag 区分两种语义"开始出 bug 时，正确的做法是把语义提升成拓扑里的一个**显式维度**。
+
+3. **被 `torch.compile` 倒逼的"按 group_name 查表"设计**：all-reduce 本可以直接 `self.device_communicator.all_reduce(x)`，但 Dynamo 无法把 `self`（任意 Python 对象）作为参数 trace 进图。约束倒逼出 §4.2 的方案：通信原语包成 `torch.ops.vllm.all_reduce`，**只传 `group_name` 字符串**，op 内部再按名字查回 coordinator（`:109-114`）。这是"为了能被编译图捕获"而牺牲一点间接性的典型取舍——不是为了优雅，而是为了让 all-reduce 能和计算融合进同一张图（见 [模块 07](../07-cuda-graph-compile/design.md)）。
+
+4. **custom all-reduce 为什么甘愿被严格条件锁死**：理论上自研 all-reduce 越通用越好，但 §4.2 的 `should_custom_ar` 只在"单节点 + NVLink 全连接 + `<8MB` + world∈{2,4,6,8}"时启用。这不是实现没做完，而是清醒的取舍：custom kernel 靠 **GPU IPC 把 peer 显存映射进本地地址空间**一次性归约，这套机制只在 NVLink P2P 可达、消息小到不值得走 NCCL 多段协议时才赢。超出范围硬上只会更慢甚至错。于是设计选择"窄而快的快路径 + NCCL 兜底"，而非"宽而平庸的通用实现"。
+
+5. **EP vs TP-on-MoE 为什么做成可切换而非二选一**：MoE 既可以"把每个专家的矩阵 TP 切开"（所有 rank 参与每个专家），也可以"把不同专家分到不同 rank"（EP）。二者通信模式（all-reduce vs all-to-all）、负载特征（均匀 vs 可能倾斜）完全不同，没有一种在所有规模下都最优。所以 vLLM 用 `enable_expert_parallel` 开关让二者共存于同一个 `FusedMoE`（§3.3），靠 `expert_map` 把"全局专家 id → 本地专家 id"的查表统一掉。这层灵活性的代价，恰恰是 9.2 里 #13784 那类"global vs local 专家数没区分清"的 bug 温床。
+
+6. **Executor 抽象为什么是整个系统的"接缝"**：把四种并行全藏在 `execute_model` 之后（§7），换来的是"调度与模型代码对底下是单卡还是多机多卡毫不知情"。但这层接缝也定义了**当前的实现边界**：V1 的 `MultiprocExecutor` 断言 `world_size == tensor_parallel_size`，于是 V1 的 PP 只能走 Ray Executor（§4.3、§7）。这不是疏忽，而是"先把 TP 这条最高频路径的进程模型做扎实，PP 这类低频跨节点场景交给 Ray 的 compiled DAG"的优先级选择。
+
+### 9.2 重要 bug 修复（真实、精选）
+
+> 下列 PR 均可在本仓库 `git log` 查到；每条点出它**暴露的设计点 / 教训**。
+
+| PR | 问题 | 暴露的设计点 / 教训 |
+|---|---|---|
+| **#15355** `[distributed] fix dp group` | 旧实现用 `has_external_dp` 布尔 +"world_size 对不上就当外部 DP"的启发式拼 world 拓扑，DP 分组在外部 DP 场景下算错 | "内部 DP / 外部 DP"是**两种根本不同的同步语义**，不该用一个 flag 兜。修复把它提升为显式的第四维 `ExternalDP`（§4.4）。教训：当一个布尔开始承载两种语义且出 bug，把它升成拓扑维度 |
+| **#16161** `fix use-ep bug to enable ep by dp/tp size > 1` | `use_ep` 的判定写成 `enable_expert_parallel and self.tp_size > 1`，导致**纯 DP（tp_size==1）下 EP 开不起来** | EP 的并行度来自 `tp_size * dp_size` 而非只看 TP。一行 `tp_size > 1` → `tp_size * dp_size > 1` 的修复，暴露了 §3.3 里"EP/DP/TP 三维如何共同决定专家分布"这个易错耦合点 |
+| **#13784** `Fix FP8 + EP` | `FusedMoE` 里 `num_experts` 一个字段同时被当"全局专家数"和"本地专家数"用，FP8+EP 组合下权重切分错位 | EP 下必须严格区分 `global_num_experts` 与 `local_num_experts = global // ep_size`。修复把这俩拆成两个字段。教训：凡是被并行切分的"数量"，全局值与本地值必须在命名上就分开（§3.3 的 `expert_map` 同源） |
+| **#11233** `Use correct device to initialize GPU data during CUDA-graph-capture` | `graph_capture()` 不接收 device 参数，捕获 CUDA graph 时在**错误的 device** 上建 stream / 初始化 GPU 数据，多卡下串味 | 多卡进程里"当前 device"是隐式全局状态，捕获 CUDA graph 这种对 device/stream 极敏感的操作必须**显式传 device**（修复把 `graph_capture(device)` 显式化）。呼应 §4.2 通信原语要能干净进编译图/CUDA graph 的约束 |
+| **#14053** `Fix shutting_down flag checking in V1 MultiprocExecutor` | `shutdown()` 里把判定写反：`if getattr(self,'shutting_down',False)` 导致正常情况下**根本不执行清理**（只有已经在关闭时才清理，逻辑颠倒） | 多进程 Executor 的关闭路径（回收 worker、释放共享内存 MessageQueue）一旦写反，资源泄漏 / 卡死且难复现。教训：守卫"只清理一次"的 flag，判定方向（`not shutting_down` 才进入）是关键一字之差 |
+| **#12934** `respect distributed_executor_backend in world_size=1` | `world_size==1` 时强制走 Uniproc，**忽略**用户显式指定的 `distributed_executor_backend`（如想用 Ray/外部 executor 做单卡调试） | §7 的"换并行=换 Executor"抽象要彻底：即便单卡也应尊重用户选的后端，否则抽象在边界条件上漏风。暴露了"world_size 派生逻辑"与"executor 选择逻辑"耦合处的边界遗漏 |

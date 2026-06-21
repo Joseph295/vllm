@@ -220,3 +220,29 @@ token_budget = max_num_batched_tokens          # 一步能算的总 token 上限
                           update_from_output() ── append token / check_stop
                                               └─ spec reject → 回退 num_computed_tokens
 ```
+
+---
+
+## 8. 设计背后的考量与历史教训
+
+### 8.1 设计背后的考量（动机与历史）
+
+1. **"取消 prefill/decode 阶段"否决了 V0 的"两套顶层策略"路线**。V0 用 `_schedule_default`（prefill 优先、明文 *"Don't schedule decodes if prefills are scheduled"*）和 `_schedule_chunked_prefill` 两套策略 + 三个队列（waiting/running/swapped）应对不同模式，逻辑分散在 `_schedule_prefills`/`_schedule_running`/`_schedule_swapped`，组合爆炸。V1 赌的是"所有模式都是给请求推进若干 token 的特例"这一抽象足够通用，于是用**一段统一循环 + 一个 `token_budget` 整数**替掉整套分流。代价是单步逻辑要兼顾全部模式、正确性全押在 `num_computed_tokens` 记账上——这也是为什么后面一长串 bug 都集中在"chunk 边界""prefix 命中边界"这类记账角落。
+
+2. **砍掉 swap-to-CPU 是"recompute + 默认 prefix caching"组合拳算过账后的结论，不是简单删功能**。V0 显存不足有 RECOMPUTE 和 SWAP 两种抢占，SWAP 还因 beam search 不支持重算而被强制使用，拖着一整套 `swapped` 队列与 `_swap_in/out`。V1 默认开 prefix caching 后，被抢占请求重算时前缀大概率命中、重算成本骤降，而 swap 的 PCIe 来回搬 KV 在大模型下往往比重算还慢；同时请求抽象从 `SequenceGroup` 降为单一 `Request`，beam search "必须 swap"的理由也消失。于是 swap 被整体移除，换来调度器与 block manager 的大幅简化。
+
+3. **chunked prefill 的两个截断点是对 Sarathi 思想的工程化补强**。仅靠 `min(num_new_tokens, token_budget)` 还不够——一条超长 prompt 即使在预算内也会吞掉整步、挤死其他请求的 decode 名额。`#15419` 引入 `long_prefill_token_threshold`，给单条长 prompt 单步可算 token 数再加一道闸。这说明"decode-piggybacking"在生产里要的不只是"能混批"，还要"防单条独占"的公平阀门。
+
+4. **"RUNNING 优先 + 抢占步不收新活"是延迟与稳定性的结构性保证，而非性能优化**。先推进所有 RUNNING（其中大量是每条只吃 1 token 的 decode）再用剩饭预算拉 WAITING，保证了正在流式输出的请求每步都拿到名额；而 `if not preempted_reqs:` 让"本步一旦抢占就不再收新请求"，避免显存已经吃紧时雪上加霜。这两条是刻意写死的调度顺序约束，体现"低 ITL 要靠结构保证、不能靠调参"。
+
+5. **演进脉络：抽象先立、记账后收敛、模块再拆分**。`#9289`（V1 1/N 落地统一抽象）→ `#12608`（统一 prefill/decode 的 slot 分配）→ `#12003`/`#15307`（把 `num_computed_tokens` 的算账逻辑收进 KVCacheManager、再做一次重构）→ `#15250`（抽出 `SchedulerInterface`）→ `#14466`（可插拔调度器）。这条线说明 V1 调度器是"先押注一个激进抽象，再用一连串记账修复把它焊牢，最后才抽接口对外开放"，顺序不可颠倒。
+
+### 8.2 重要 bug 修复（真实、精选）
+
+| PR | 问题 | 暴露的设计点 / 教训 |
+|---|---|---|
+| `#11186` | prompt 长度恰为 block_size 整数倍且全部命中 prefix cache 时，`num_new_tokens==0`，无 token 可调度 | 暴露核心不变量 **`num_computed_tokens` 必须是 block_size 整数倍**。修复是回退**整整一个 block**（`num_computed_tokens -= block_size`）强制重算最后一块，而非只退 1 个 token——记账不变量比省那点算力更重要 |
+| `#12065` | VLM 调度：因 prefix caching，`num_computed_tokens` 可能已 **超过** encoder 输入的 `start_pos`，旧逻辑算出负的 `num_new_tokens` | "统一 token 抽象"与"多模态 encoder 输入必须整块处理"在 prefix 命中时打架；修复显式处理 `num_computed_tokens >= start_pos` 时只能本步调度 0 token。教训：每引入一种新模式，都要重新核对它与 prefix caching 的边界 |
+| `#12674` | 对 partial（chunked prefill 中途）请求有多余的调度约束 | 早期为安全给 partial 请求加了限制，反而阻碍混批；移除后才真正释放 chunked prefill + decode 同批的吞吐。说明保守约束会悄悄吃掉抽象本该带来的收益 |
+| `#12545` | 请求 abort 后，其 encoder cache 未释放 | 调度器持有的 encoder cache 也是需要按生命周期回收的资源；修复把 `free` 拆成 `free_encoder_input`（单个）与 `free`（整请求），abort 路径调用整请求版本。多模态让"资源回收"的面变大了 |
+| `#13169` | preemption 未被指标系统正确记账 | 抢占是 V1 唯一的显存兜底手段，却长期对可观测性"隐身"；补上 preemption 计数后，生产中"显存抖动"才变得可诊断。教训：核心兜底路径必须可观测 |
