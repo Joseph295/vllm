@@ -20,6 +20,50 @@
 
 V1 是 2024 下半年开始的重写，开关由环境变量 `VLLM_USE_V1` 控制。本系列**以 V1 为主线**，在关键处对比 V0 说明"为什么要重构"。
 
+### V0 与 V1 的关系，以及如何区分一段代码属于哪套
+
+**关系不是"平级二选一"，而是"重写版 + 遗留版"**：
+
+```
+V1 = 对 vLLM 引擎核心的整体重写（默认启用，VLLM_USE_V1 默认=1）
+      ├─ 重写：调度器、KV/前缀缓存、进程模型(EngineCore 独立进程)、
+      │        投机解码、采样、CUDA graph(piecewise) ……
+      └─ 复用：模型定义层、大部分 kernel(csrc/)、分布式原语、量化/LoRA 算子
+V0 = 遗留实现(legacy)，现在主要作为 fallback：请求了 V1 尚不支持的特性时自动回退
+```
+
+两者**共享"下半身"**（`vllm/model_executor/models/`、`csrc/`、`vllm/distributed/`、`quantization/`、`lora/` 的底层算子），**分叉在"上半身"**（引擎编排、调度、KV 管理、worker 执行流程）。
+
+**运行时如何决定走哪套**（代码路径）：
+1. `VLLM_USE_V1` 默认 `1`（`vllm/envs.py:528-529`）。
+2. `EngineArgs._is_v1_supported_oracle(...)`（`vllm/engine/arg_utils.py:1368`）逐项检查配置，遇到 V1 尚不支持的特性就 `return False` → 回退 V0。典型触发：`--kv-transfer-config`（PD 分离，仅 V0）、部分 encoder-decoder 模型等。
+3. `LLMEngine.__new__`（`vllm/engine/llm_engine.py:518`）据此把对象重定向到 `vllm.v1.engine.llm_engine.LLMEngine`。
+   > ⚠️ 注意：V0 的 `LLMEngine.__new__` 在 `VLLM_USE_V1` 时直接返回 V1 实例——`from vllm.engine.llm_engine import LLMEngine` 拿到的运行时类型可能是 V1 的，**光看 import 路径会被骗**。
+
+**判别清单（按可靠度排序）**：
+
+① **看路径（最可靠）**：
+
+| 属于 V1 | 属于 V0 | 公用（都不算） |
+|---|---|---|
+| `vllm/v1/**` 全部 | `vllm/core/scheduler.py`、`block_manager.py`<br>`vllm/worker/`<br>`vllm/engine/llm_engine.py`<br>`vllm/spec_decode/` | `vllm/model_executor/`、`csrc/`<br>`vllm/distributed/`<br>`vllm/lora/`、`quantization/` 算子 |
+
+一句话：**路径里有 `/v1/` 就是 V1；`vllm/core/scheduler.py`、`vllm/worker/`、`vllm/engine/llm_engine.py` 是 V0。**
+
+② **看 import**：`from vllm.v1.xxx` → V1；`from vllm.core.scheduler` / `from vllm.worker.xxx` → V0。
+
+③ **看结构特征（标志物）**：
+
+| 特征 | V1 | V0 |
+|---|---|---|
+| 引擎进程 | **EngineCore 独立进程** + ZMQ/msgpack | 引擎与 API server 同进程 |
+| 调度抽象 | 无 prefill/decode 阶段，统一 `num_computed_tokens` | 分 prefill/decode batch，有 swap in/out |
+| KV 管理 | `KVCacheManager` + `block_pool` + hash 化 prefix cache | `BlockSpaceManager` + `evictor` |
+| worker 执行 | `GPUModelRunner.execute_model(scheduler_output)` | `ModelRunner` + `Worker` 多步流程 |
+| 投机解码 | 原位 MQA 验证 + Triton `rejection_sampler` | `SpecDecodeWorker` + batch expansion |
+
+④ **运行时确认**：V1 启动日志打印 `Initializing a V1 LLM engine (v...)`（`vllm/v1/engine/core.py:57`）；或设 `VLLM_USE_V1=0` 强制 V0、`=1` 强制 V1。
+
 ## 模块索引
 
 | # | 模块 | 主要代码锚点 | 文档 |
