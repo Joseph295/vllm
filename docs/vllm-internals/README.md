@@ -118,6 +118,7 @@ V0 = 遗留实现(legacy)，现在主要作为 fallback：请求了 V1 尚不支
 | 08 | **Quantization 量化** | `model_executor/layers/quantization/` | [design](08-quantization/design.md) · [impl](08-quantization/impl.md) |
 | 09 | **LoRA 多适配器** | `vllm/lora/` | [design](09-lora/design.md) · [impl](09-lora/impl.md) |
 | 10 | **Multimodal 多模态** | `vllm/multimodal/`、`v1/core/encoder_cache_manager.py` | [design](10-multimodal/design.md) · [impl](10-multimodal/impl.md) |
+| 11 | **GPU 执行底层：Kernel 与显存** —— 深入 csrc/ CUDA 源码 | `csrc/attention/`、`csrc/cache_kernels.cu`、`csrc/custom_all_reduce.cu`、`csrc/quantization/` | [design](11-gpu-kernels-memory/design.md) · [impl](11-gpu-kernels-memory/impl.md) |
 
 ## 端到端全景图（一条请求如何穿过 11 个模块）
 
@@ -318,6 +319,13 @@ TP 与 PP 是两种正交的切法：**TP 把"每一层"横向切开（切矩阵
           05 投机解码（在调度+KV+采样之上叠加 draft/verify）
 
    横切关注点（被多个模块使用）：07 CUDA Graph/编译、08 量化、09 LoRA
+
+   GPU 底层（02/03/07/08 的 CUDA 源码延伸）：11 GPU Kernel 与显存
+     ├─ PagedAttention kernel 内幕  ◀── 02 的 GPU 实现
+     ├─ KV 显存 profiling / 布局      ◀── 02
+     ├─ CUDA graph 显存池 / stream    ◀── 07
+     ├─ custom all-reduce GPU IPC     ◀── 03
+     └─ 量化 GEMM（Marlin）kernel     ◀── 08
 ```
 
-> 建议阅读顺序：先读 **00 总览**建立全局执行骨架，再按 `01 → 02 → 03` 打通"调度—显存—分布式"主干，最后按需阅读 04~10 的专题模块。
+> 建议阅读顺序：先读 **00 总览**建立全局执行骨架，再按 `01 → 02 → 03` 打通"调度—显存—分布式"主干，按需阅读 04~10 的专题模块；想钻 GPU 底层 / CUDA kernel 则读 **11**。

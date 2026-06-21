@@ -233,7 +233,7 @@ torch.ops._C_cache_ops.reshape_and_cache_flash(
 - `get_quant_method(self, prefix=prefix)` 把**层的全限定名**传进来。`awq.py:78 is_layer_skipped_awq`、`compressed_tensors.py:86 should_ignore_layer`、`fp8.py` 的 `ignored_layers` 都用 prefix 做正则/子串匹配，命中就返回 `UnquantizedLinearMethod`。于是 `lm_head` 或某些敏感层可以保持 FP16，其余量化——精度/速度的细粒度取舍落在每一层。
 
 ### T4 · Marlin 重排在加载时一次性做，换 forward 零 reshuffle
-- `kernels/mixed_precision/marlin.py:66-79` 用 `ops.gptq_marlin_repack` + `marlin_permute_scales` 把权重/scale 排成 Tensor-Core MMA 布局。**关键认知**：MMA 指令要求操作数按特定 lane 排布，若 forward 时排每次 GEMM 都要 reshuffle。把这"贵但只做一次"的重排放进 `process_weights_after_loading`，热路径 `gptq_marlin_gemm` 就能把 int4 直流 MMA。这是 weight-only 高吞吐的工程支点。
+- `kernels/mixed_precision/marlin.py:66-79` 用 `ops.gptq_marlin_repack` + `marlin_permute_scales` 把权重/scale 排成 Tensor-Core MMA 布局。**关键认知**：MMA 指令要求操作数按特定 lane 排布，若 forward 时排每次 GEMM 都要 reshuffle。把这"贵但只做一次"的重排放进 `process_weights_after_loading`，热路径 `gptq_marlin_gemm` 就能把 int4 直流 MMA。这是 weight-only 高吞吐的工程支点。`gptq_marlin_gemm` **GPU GEMM kernel 的线程/warp 映射、边读边反量化路径，以及 permute_cols 重排 kernel 的 csrc/ 实现**见 [模块 11](../11-gpu-kernels-memory/impl.md)。
 
 ### T5 · scale 和 zero_point 的重排 permutation 不一样
 - `marlin_utils.py:206 get_scale_perms` 给出**两套** permutation：`scale_perm`(64) 用于 grouped scale、`scale_perm_single`(32) 用于 channelwise(`group_size=-1`)。`marlin_zero_points`（`:248`）**不用 single 版**，因为 zero-point 在每个 MMA 都参与（`:250-251` 注释），还要额外 interleave 列维并 pack int32（`:255`，interleave 表 `[0,2,4,6,1,3,5,7]`/`[0,2,1,3]`）。grouped 与 channelwise 对应 MMA 不同的 fragment stride，所以 perm 不同。

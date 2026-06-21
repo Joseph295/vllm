@@ -151,7 +151,7 @@ CUDA graph 一个 size 一张图。服务负载的 batch size 千变万化，不
 
 顺序不能反：CUDA graph 录的是"实际会执行的那串 kernel"。若没先编译好，录下来的就是未优化的 eager kernel，甚至录到编译过程本身。warmup 则是为了让 cuBLAS/Inductor 的惰性初始化、autotune 在录制**之前**完成，否则会被错误地录进 graph。
 
-> **从大 size 到小 size 捕获**（`reversed`，`gpu_model_runner.py:1614`）是个 memory trick：大 size 的 CUDA graph 显存池可被小 size 复用（共享 `global_graph_pool`，`backends.py:313`），反过来则要为每个 size 单独留池子。
+> **从大 size 到小 size 捕获**（`reversed`，`gpu_model_runner.py:1614`）是个 memory trick：大 size 的 CUDA graph 显存池可被小 size 复用（共享 `global_graph_pool`，`backends.py:313`），反过来则要为每个 size 单独留池子。CUDA graph **显存池如何在 GPU 上分配/复用、capture 期持久 buffer 的 GPU 视角细节**见 [模块 11](../11-gpu-kernels-memory/design.md)。
 
 ### 3.7 V0 整图 cudagraph vs V1 piecewise（核心对比）
 

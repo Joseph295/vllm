@@ -249,7 +249,7 @@ const int64_t physical_block_number =
 const cache_t* k_ptr = k_cache + physical_block_number * kv_block_stride
                        + kv_head_idx * kv_head_stride + physical_block_offset * x;
 ```
-> 这就是 design §1 "kernel 要能跨非连续块算 attention" 的全部实现：把朴素 attention 里"连续 KV 数组的下标"换成"`block_table[逻辑块]` 查出的物理块号"。多了一次间接寻址，就让物理块可以任意乱序、共享、被抢占重分配。Python 绑定见 `_custom_ops.py:40`（v1）/`:69`（v2）。
+> 这就是 design §1 "kernel 要能跨非连续块算 attention" 的全部实现：把朴素 attention 里"连续 KV 数组的下标"换成"`block_table[逻辑块]` 查出的物理块号"。多了一次间接寻址，就让物理块可以任意乱序、共享、被抢占重分配。Python 绑定见 `_custom_ops.py:40`（v1）/`:69`（v2）。这段 kernel 内部的**线程/warp 映射、每线程负责哪些 head/token、reshape_and_cache 写入 kernel 的 GPU 视角细节**见 [模块 11](../11-gpu-kernels-memory/impl.md)。
 
 至此一个调度步的 KV 读写闭环完成；下一步 `update_from_output` 里若请求结束就 `free`（见 §4）。
 

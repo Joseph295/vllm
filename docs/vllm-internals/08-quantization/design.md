@@ -100,7 +100,7 @@ QuantizeMethodBase (ABC)                       # "这一层怎么存权重、怎
 
 checkpoint 里的量化权重是**按通用规则 packing** 的（如 GPTQ 把 8 个 int4 沿某维塞进一个 int32）。但 Marlin/Machete 这类 kernel 直接把量化权重喂进 NVIDIA **Tensor Core 的 MMA 指令**，MMA 要求每个 warp 的操作数元素按一种**特定的、非行主序的 lane 排布**。如果 forward 时再去重排，每次 GEMM 都要 reshuffle，得不偿失。
 
-于是 vLLM 在加载后**一次性**把权重 shuffle 成 MMA 期望的交错布局（`ops.gptq_marlin_repack`），把 scale/zero_point 也按对应 permutation 重排（`marlin_permute_scales` / `marlin_zero_points`，`marlin_utils.py:217/248`），并 pack 进 int32 以匹配 kernel 的向量化反量化路径。代价是加载慢一点点、多一份内存峰值；收益是 forward 时**量化权重直接流进 MMA 单元，零额外 reshuffle**。`marlin_zero_points` 的注释（`marlin_utils.py:250-251`）点明："zero-points 在每个 MMA 上都要用，所以也要按 MMA 访问模式重排"。
+于是 vLLM 在加载后**一次性**把权重 shuffle 成 MMA 期望的交错布局（`ops.gptq_marlin_repack`），把 scale/zero_point 也按对应 permutation 重排（`marlin_permute_scales` / `marlin_zero_points`，`marlin_utils.py:217/248`），并 pack 进 int32 以匹配 kernel 的向量化反量化路径。代价是加载慢一点点、多一份内存峰值；收益是 forward 时**量化权重直接流进 MMA 单元，零额外 reshuffle**。`marlin_zero_points` 的注释（`marlin_utils.py:250-251`）点明："zero-points 在每个 MMA 上都要用，所以也要按 MMA 访问模式重排"。Marlin **GEMM kernel 边读边反量化直流 MMA 的 GPU 实现、以及 permute_cols 权重重排 kernel 的 csrc/ 细节**见 [模块 11](../11-gpu-kernels-memory/design.md)。
 
 GPTQ 的 act-order（`desc_act`）还要在此 `argsort(g_idx)` 把列按量化分组排序（`gptq.py:254` / Marlin kernel 的 `g_idx_sort_indices`），FP8 W8A8 则在此把多个逻辑分片（qkv、gate_up）的不同 per-tensor scale **重量化合并成单一 scale**（`requantize_with_max_scale`，`fp8.py:370`），因为 `torch._scaled_mm` 只接受 per-tensor scale。
 

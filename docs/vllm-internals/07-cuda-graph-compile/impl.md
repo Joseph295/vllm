@@ -323,7 +323,7 @@ return self.impl.forward(self, query, key, value, kv_cache, attn_metadata)  # :3
 
 ### T5 · 从大 size 到小 size 捕获，复用同一显存池
 - **代码**：`gpu_model_runner.py:1614` `for num_tokens in reversed(...)`；`backends.py:313-319` 全局共享 `global_graph_pool`。
-- **精妙之处**：CUDA graph 的中间激活占显存。先录最大 size（占最多显存），其显存池可被后续小 size 的 graph **复用**（小的需求一定 ≤ 大的）。反过来从小到大，则每个大 size 都要新开池子，显存浪费。`pool=self.graph_pool`（`backends.py:677`）让所有段/所有 size 共享一个池。
+- **精妙之处**：CUDA graph 的中间激活占显存。先录最大 size（占最多显存），其显存池可被后续小 size 的 graph **复用**（小的需求一定 ≤ 大的）。反过来从小到大，则每个大 size 都要新开池子，显存浪费。`pool=self.graph_pool`（`backends.py:677`）让所有段/所有 size 共享一个池。这个 **CUDA graph 显存池在 GPU 上的分配/复用机制、stream 与 H2D 重叠的 GPU 视角细节**见 [模块 11](../11-gpu-kernels-memory/impl.md)。
 
 ### T6 · 先 compile 再 capture，且 warmup 必须在 capture 之前
 - **代码**：`gpu_worker.py:206-216` 先 `_dummy_run(warmup_sizes)` 再 `capture_model`；`backends.py:641-649` 每个 size capture 前先跑 `cudagraph_num_of_warmups` 次。

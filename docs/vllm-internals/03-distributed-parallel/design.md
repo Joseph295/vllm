@@ -129,7 +129,7 @@ always try custom all-reduce first  → 否则 pynccl  → 否则 torch.distribu
 - **pynccl**：vLLM 直接 ctypes 绑定 NCCL（`pynccl.py`），绕过 PyTorch 的 NCCL 封装，可在 CUDA graph 内被捕获、可控制 stream（见 [模块 07](../07-cuda-graph-compile/design.md)）。
 - **torch.distributed**：兜底（主要测试场景）。
 
-> **为什么 custom all-reduce 在小消息上比 NCCL 快**：NCCL 的 ring/tree all-reduce 在小张量上**延迟受启动开销和多次 kernel launch 主导**，吞吐优势发挥不出来。vLLM 的 custom kernel 用 **IPC 把各 rank 的 buffer 直接映射进彼此地址空间**，一次性 kernel 读写 peer 显存完成归约，省掉 NCCL 的协议握手与多段传输——在 decode 阶段（每步激活只有几 KB~几 MB、且 all-reduce 极其高频）收益最大。一旦消息超过 `max_size` 或跨节点/PCIe-only，就退回 NCCL。
+> **为什么 custom all-reduce 在小消息上比 NCCL 快**：NCCL 的 ring/tree all-reduce 在小张量上**延迟受启动开销和多次 kernel launch 主导**，吞吐优势发挥不出来。vLLM 的 custom kernel 用 **IPC 把各 rank 的 buffer 直接映射进彼此地址空间**，一次性 kernel 读写 peer 显存完成归约，省掉 NCCL 的协议握手与多段传输——在 decode 阶段（每步激活只有几 KB~几 MB、且 all-reduce 极其高频）收益最大。一旦消息超过 `max_size` 或跨节点/PCIe-only，就退回 NCCL。custom all-reduce 的 **GPU IPC 显存映射、NVLink P2P 探测、one-shot / two-shot kernel 的 GPU 视角实现**见 [模块 11](../11-gpu-kernels-memory/design.md)。
 > 设计动机出处：vLLM PR #2192 / #2760（custom all-reduce 引入与多 GPU 支持），动机即"小消息低延迟 all-reduce"。
 
 `GroupCoordinator.all_reduce`（`:292-318`）还包了一层 **PyTorch custom op**（`torch.ops.vllm.all_reduce`，`:312`）：因为 Dynamo/torch.compile 不能把 `self` 这种任意对象传进图，于是只传 `group_name` 字符串，再在 op 内部按名字查回 coordinator（`:109-114`）——这是为了让 all-reduce 能被 `torch.compile` 正确捕获（见 [模块 07](../07-cuda-graph-compile/design.md)）。

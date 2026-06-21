@@ -402,7 +402,7 @@ self.world_size_across_dp = self.world_size * self.data_parallel_size      # :16
 
 ### T6 · custom all-reduce 凭什么比 NCCL 快（且只在小消息用）
 - **代码**：`custom_all_reduce.py:213-226` `should_custom_ar`；`:241-245` 的 `ops.all_reduce`。
-- **精妙之处**：custom AR 用 **IPC 把各 rank 的 buffer 互相映射进对方地址空间**，一个 kernel 直接读写 peer 显存完成归约，省掉 NCCL ring/tree 协议的握手与多段传输——这在**小张量、超高频**的 decode all-reduce 上把延迟压到最低。但它只在 `<8MB`、world∈{2,4,6,8}、单节点、NVLink 全连接时启用（`:224-226` + `__init__` 的层层 disable）；超出就退回 NCCL，因为大消息 NCCL 的带宽优势反超。`registered=True`（CUDA graph 内）走预注册 buffer 免拷贝，`registered=False`（eager）多一次 cudaMemcpy 但 `<=1% 延迟`（`:261-263` 注释）。
+- **精妙之处**：custom AR 用 **IPC 把各 rank 的 buffer 互相映射进对方地址空间**，一个 kernel 直接读写 peer 显存完成归约，省掉 NCCL ring/tree 协议的握手与多段传输——这在**小张量、超高频**的 decode all-reduce 上把延迟压到最低。但它只在 `<8MB`、world∈{2,4,6,8}、单节点、NVLink 全连接时启用（`:224-226` + `__init__` 的层层 disable）；超出就退回 NCCL，因为大消息 NCCL 的带宽优势反超。`registered=True`（CUDA graph 内）走预注册 buffer 免拷贝，`registered=False`（eager）多一次 cudaMemcpy 但 `<=1% 延迟`（`:261-263` 注释）。这套 **GPU IPC handle 交换、NVLink P2P 可达性探测、one-shot 与 two-shot 归约 kernel 的 csrc/ 实现**见 [模块 11](../11-gpu-kernels-memory/design.md)。
 
 ### T7 · NCCL barrier "有毒"，同步走 CPU group
 - **代码**：`parallel_state.py:673-680` `barrier()` 用 `cpu_group`；注释明示原因。

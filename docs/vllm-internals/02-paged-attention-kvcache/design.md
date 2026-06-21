@@ -71,7 +71,7 @@ vLLM 的核心洞察：**把操作系统的虚拟内存分页（paging）搬到 
     → 写入 cache[slot]                       → 读 cache[地址]
 ```
 
-这就是 PagedAttention kernel 与朴素 attention 的唯一区别：**多一次 `block_table[logical] → physical` 的间接寻址**。物理实现见 [`impl.md`](impl.md) §2。
+这就是 PagedAttention kernel 与朴素 attention 的唯一区别：**多一次 `block_table[logical] → physical` 的间接寻址**。物理实现见 [`impl.md`](impl.md) §2；attention kernel 如何用 block table 取 KV、reshape_and_cache 写入的**线程/warp 级 CUDA 实现**见 [模块 11](../11-gpu-kernels-memory/impl.md)。
 
 ### 3.2 V0 → V1 的 KV 管理对比（为什么 V1 重写了这一层）
 
