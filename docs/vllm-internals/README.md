@@ -64,6 +64,45 @@ V0 = 遗留实现(legacy)，现在主要作为 fallback：请求了 V1 尚不支
 
 ④ **运行时确认**：V1 启动日志打印 `Initializing a V1 LLM engine (v...)`（`vllm/v1/engine/core.py:57`）；或设 `VLLM_USE_V1=0` 强制 V0、`=1` 强制 V1。
 
+### V0 vs V1 执行流程对比
+
+```
+═══════════════════ V0（legacy · 单进程）════════════════ │ ═════════════════ V1（current · 双进程）═══════════════
+                                                          │
+┌───────────── 单个 Python 进程（共享 GIL）─────────────┐ │  ┌────────── 进程 1：API server（前端·asyncio）──────────┐
+│  API server (FastAPI)                                 │ │  │  Processor.process_inputs：tokenize/多模态(CPU)        │
+│     │ add_request                                     │ │  │  OutputProcessor：detokenize(CPU,后台 output_handler) │
+│     ▼                                                 │ │  └───────────────┬───────────────────────▲─────────────┘
+│  LLMEngine.step()  ◀──── 同步循环，反复调用           │ │   EngineCoreRequest│ ZMQ+msgpack         │EngineCoreOutputs
+│   ┌─────────────────────────────────────────────┐    │ │   (ROUTER/DEALER)  ▼  零拷贝          (PUSH/PULL)│
+│   │ ① Scheduler.schedule()                       │    │ │  ┌────────── 进程 2：EngineCore（后端·同步 busy loop）──┐
+│   │    三队列：waiting / running / swapped        │    │ │  │  run_busy_loop: while True → step():                 │
+│   │    · prefill 与 decode 分阶段（分开成批）      │    │ │  │   ┌────────────────────────────────────────────────┐ │
+│   │    · 显存不足→抢占：SWAP(换出到CPU) 或 RECOMP  │    │ │  │   │ ① schedule()  无 prefill/decode 之分            │ │
+│   │    · 产物 SeqGroupMetadata + SchedulerOutputs │    │ │  │   │    统一 num_computed_tokens 追 num_tokens       │ │
+│   │ ② executor.execute_model()                   │    │ │  │   │    prefill+decode 混批；抢占只 RECOMPUTE(无SWAP) │ │
+│   │    Worker → ModelRunner.forward + sample      │    │ │  │   │    产物 SchedulerOutput                          │ │
+│   │ ③ _process_model_outputs()  同进程 detokenize │    │ │  │   │ ② executor.execute_model()  MessageQueue 广播   │ │
+│   └─────────────────────────────────────────────┘    │ │  │   │    Worker → GPUModelRunner.execute_model         │ │
+│   tokenize/detokenize/调度/采样后处理 全抢同一 GIL    │ │  │   │ ③ update_from_output()  append/check_stop/回退  │ │
+└───────────────────────────────────────────────────────┘ │  │   └────────────────────────────────────────────────┘ │
+                                                          │  │   ＋ 输入/输出各一 IO 线程跑 ZMQ（释放 GIL 与 GPU 重叠）│
+  特点：实现直观、单进程易调试；                          │  └──────────────────────────────────────────────────────┘
+  但 CPU 后处理周期性"卡住"GPU，长 prefill 阻塞 decode。   │   特点：GPU 关键路径独占进程、CPU 活并行不挡道；
+                                                          │         统一抽象天然支持 chunked prefill / prefix cache / spec。
+```
+
+| 维度 | V0 | V1 |
+|---|---|---|
+| 进程模型 | 单进程，引擎与 API server 同 GIL | **EngineCore 独立进程** + ZMQ/msgpack，CPU/GPU 重叠 |
+| 调度抽象 | prefill / decode **分阶段**，三队列(`waiting/running/swapped`) | **无阶段之分**，统一 `num_computed_tokens` 推进 |
+| 长 prompt | prefill 独占整步 → 阻塞 decode（head-of-line） | `chunked prefill` 混批，不阻塞 decode |
+| 抢占策略 | RECOMPUTE **或** SWAP（换出 KV 到 CPU） | 只 RECOMPUTE，**砍掉 swap** |
+| 驱动方式 | 主线程同步 `step()` 循环 | 后端 busy loop + 前端单一 `output_handler` |
+| KV 管理 | `BlockSpaceManager` + `evictor` | `KVCacheManager` + `block_pool` + hash `prefix caching` |
+
+> 代码锚点：V0 `step()` 在 `vllm/engine/llm_engine.py`、三队列在 `vllm/core/scheduler.py:469-475`、抢占模式(RECOMPUTE/SWAP)在 `vllm/core/scheduler.py:487` 一带；V1 `step()` 在 `vllm/v1/engine/core.py:195`、统一调度在 `vllm/v1/core/sched/scheduler.py:122`（详见 [模块 00](00-request-lifecycle/design.md) 与 [模块 01](01-scheduler-batching/design.md)）。
+
 ## 模块索引
 
 | # | 模块 | 主要代码锚点 | 文档 |
