@@ -30,7 +30,7 @@
 | `model_executor/layers/fused_moe/layer.py` 的 `FusedMoE` | MoE 层，含 `ep_size`/`expert_map`，在 **TP-on-MoE 与 EP** 间切换 |
 | `sequence.py` 的 `IntermediateTensors` | PP 段间传递的 `{hidden_states, residual}` 载荷 |
 | `v1/executor/multiproc_executor.py` 的 `MultiprocExecutor` | 多进程 TP 执行后端（V1 当前 `world_size==tp_size`） |
-| `v1/executor/ray_distributed_executor.py` 的 `RayDistributedExecutor` | 支持 PP 的执行后端（用 Ray compiled DAG 流过各 stage） |
+| `v1/executor/ray_distributed_executor.py` 的 `RayDistributedExecutor` | 支持 PP 的执行后端（用 Ray compiled DAG 流过各 stage；不熟 Ray 先读 [RAY-PRIMER](../RAY-PRIMER.md)） |
 | `v1/engine/core.py` 的 `DPEngineCoreProc` | DP 专用的 EngineCore 进程：finish 同步、空闲时跑 dummy batch |
 
 ### 1.3 和相似模块 / 概念的区别与联系（专治"听过但分不清"）
