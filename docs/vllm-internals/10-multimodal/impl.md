@@ -40,6 +40,8 @@ V1 执行层 vllm/v1/worker/
 
 ### 阶段 A：前端输入预处理 —— 占位符扩展 + hash（P0 进程）
 
+> **这一步在干嘛**：用户发来「文字 + 图片」，这一步在前端把它们一起处理好：文字 tokenize 成 token id，图片先过 HF 的 image processor 变成模型要的张量、再在 prompt 里把 `<image>` 这种符号**展开成 N 个占位 token**（N = 这张图会产出多少视觉 token），同时记下「每张图占序列哪一段」和「这张图的 hash」。最后还把大像素张量按 hash 决定要不要真的传给后端。
+
 **A1.** `vllm/v1/engine/processor.py:194` `Processor.process_inputs()`
 - `:225-230` 调 `input_preprocessor.preprocess(..., return_mm_hashes=self.use_hash)`：tokenize 文本 **并** 对多模态走 merged processor（见 A2）。`use_hash`（`processor.py:54`）在「未禁用 mm 预处理缓存」或「开启 prefix caching」时为真——后者要把 mm hash 喂进 token hash 以支持含图前缀的 prefix 复用。
 - `:241-245` `split_enc_dec_inputs`；V1 不支持真正的 encoder-decoder，`:245` 直接 `NotImplementedError`。
@@ -94,6 +96,8 @@ for mm_input, mm_hash in zip(mm_inputs, mm_hashes):
 
 ### 阶段 B：后端还原 —— P1 镜像缓存
 
+> **这一步在干嘛**：请求跨进程到了后端（EngineCore）。如果前端为了省 IPC 把某张图的张量置成了 None（只传了 hash），后端就凭这个 hash 从自己那份「镜像缓存」里把张量取回来，补回 `Request` 里——这样后端拿到的就是完整的 mm 输入了。
+
 **B1.** `vllm/v1/engine/mm_input_cache.py:62` `MirroredProcessingCache.get_and_update_p1()`（P1 侧，由 `EngineCore.add_request` 调用，见 [模块 00](../00-request-lifecycle/impl.md) 阶段 D2）
 ```python
 for mm_input, mm_hash in zip(mm_inputs, mm_hashes):
@@ -110,6 +114,8 @@ for mm_input, mm_hash in zip(mm_inputs, mm_hashes):
 ---
 
 ### 阶段 C：调度 —— encoder budget + encoder cache 双约束
+
+> **这一步在干嘛**：调度器在决定「这一步给这条请求算多少 token」时，多模态请求还要额外问两件事——这一步能不能跑得起这张图的 encoder（**compute 预算**够不够）、缓存里还放不放得下它的输出（**cache 空间**够不够）。如果放不下，就把这一步的 token 截断到这张图**之前**，让这步只算图前面的文本，等下一步腾出预算再整张算这张图。因为图的 encoder 是双向注意力、必须整块算，绝不能算半张。
 
 > 本阶段叠加在调度器的 `chunked prefill` / token budget 主框架之上（scheduler 主干、`num_new_tokens` 与 FCFS 调度见 [模块 01](../01-scheduler-batching/design.md)），这里只讲多模态分支额外引入的 encoder compute / cache 双约束。
 
@@ -187,6 +193,8 @@ for input_id in list(cached_encoder_input_ids):
 ---
 
 ### 阶段 D：执行 —— 跑 encoder + scatter 进 decoder（GPU）
+
+> **这一步在干嘛**：到 GPU 上真正干活了。先把这一步要算的图喂给 vision encoder（ViT 之类）跑出 embedding 存进缓存；再从缓存里**切出本步 token 窗口覆盖到的那段视觉 embedding**；然后把所有 token id 过 embedding 层得到文本 embedding，并把视觉 embedding**按占位 token id 覆盖到对应行**——拼成一张「文本 + 视觉」混合的输入嵌入喂给 decoder。Qwen2-VL 这类还要算 M-RoPE 的 3D 位置。
 
 入口：`gpu_model_runner.py:1014` `if self.is_multimodal_model:`（`:103` 设置）。
 

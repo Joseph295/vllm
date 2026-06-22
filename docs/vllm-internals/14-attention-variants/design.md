@@ -9,7 +9,44 @@
 
 ---
 
-## 1. 这个模块解决什么问题
+## 1. 背景与定位
+
+> 如果你还不清楚 **full attention、KV cache、prefix caching、GQA/MQA** 这些前置概念，请先读 [PRIMER 第一部分](../PRIMER.md#第一部分llm-推理服务-101先建立心智模型) 与 [模块 02](../02-paged-attention-kvcache/design.md)（分页 KV、前缀复用），这里默认你已经有了那套心智模型。
+
+### 1.1 位置
+
+本模块讲三种"非标准 full attention"变体（SWA / Cascade / GQA·MQA），它们都属于 [PRIMER §2.1](../PRIMER.md#21-两条-track先分清骨架和血肉) 里"模型架构技术"那条 track，但**实现上不是另起炉灶，而是 [模块 02](../02-paged-attention-kvcache/design.md) PagedAttention / Prefix Caching 抽象的特化或复用**。在一个请求的旅程（[PRIMER §2.2](../PRIMER.md#22-一个请求穿过哪些东西30-秒速览)）里，它们各自动一处：
+
+- **SWA**：动 KV cache 管理层——让窗口外的 block 提前释放，把 KV 占用从 O(L) 压到 O(W)。
+- **Cascade**：动 attention backend 的 kernel 调度——批内多条请求共享的公共前缀只算一次。
+- **GQA/MQA**：动模型层 + cache 格式——多个 query 头共享一组 KV 头，cache 张量的头数维变小。
+
+一句话：**三者都围绕"KV cache 的存与算"做文章，互相正交、可任意叠加，且都复用模块 02 的 block / block table / 空闲链表 / ref_cnt，没有发明新的 KV 结构。**
+
+> 🔗 回扣[贯穿示例](../PRIMER.md#第三部分一个贯穿全文的玩具示例强烈建议先看懂这个)：示例阶段⑤的 decode 步里，`q3` 默认要看 KV cache 里**全部 4 个 token**（pos0~3）。**若这是 SWA（窗口 W=2）**，`q3` 就只看最近 2 个（pos2、pos3）的 KV，pos0/pos1 所在的 block 可提前释放、用 `null_block` 占位。**若有多条请求共享前缀**（比如都以 `[11,7]` 开头，block_table 都指向物理块 7），**Cascade** 让这段公共前缀的 attention 只算一次、再和各请求独有后缀合并，而不是每条都把前缀 KV 重读一遍。**若模型是 GQA**，示例里 2 个 head 的 K/V 可能只存 1 组（两个 query 头共享），cache 第 4 维从 2 缩到 1。
+
+### 1.2 关键文件与类各干什么（先认人）
+
+| 文件 / 类 | 主要作用（一句话） |
+|---|---|
+| `specialized_manager.py` 的 `SlidingWindowManager` | SWA 的 KV 管理：重写"命中查找"（从右往左凑连续窗口块）和"释放窗外块"两个方法 |
+| `specialized_manager.py` 的 `FullAttentionManager` | 对照基线：标准 full attention，从左连续命中、从不释放块 |
+| `kv_cache_interface.py` 的 `SlidingWindowSpec` | SWA 层的 KV cache 格式：带 `sliding_window` 字段，按窗口而非 max_model_len 估显存 |
+| `flash_attn.py` 的 `cascade_attention` | Cascade 的两段 attention：前缀 kernel + 后缀 kernel + LSE 合并 |
+| `flash_attn.py` 的 `use_cascade_attention` | 决定要不要启用 Cascade（支持性检查 + 收益启发式 + 性能模型） |
+| `merge_attn_states`（`attention/ops/`） | 把前缀/后缀两段 partial attention 按 log-sum-exp 合并，逐 bit 等价于一次算 |
+| `config.py` 的 `get_num_kv_heads` | GQA/MQA 的核心量：算出每 GPU 的 KV 头数（按 TP 切分，MLA 退化为 1） |
+| `KVCacheManager` / `BlockPool`（属 [模块 02](../02-paged-attention-kvcache/design.md)） | SWA 的块释放、Cascade 的公共前缀检测都复用它的空闲链表 / ref_cnt，三者对它零~低侵入 |
+
+### 1.3 和相似模块 / 概念的区别与联系（专治"听过但分不清"）
+
+- **SWA vs full attention**：full attention 的 query 看前面**全部** token（KV 随序列 O(L) 无限增长）；SWA 只看**最近 W 个** token（窗口外 KV 可丢弃，占用降到 O(W)）。SWA 是用"看得短"换"省显存"，靠"信息跨层逐跳传播"弥补感受野。详见 [PRIMER §2.4](../PRIMER.md#24-易混概念对照区别与联系专治听过但分不清)。
+- **Cascade vs 各自算**：不开 Cascade 时，N 条共享前缀的请求每条都把公共前缀的 KV 完整读一遍算 attention（前缀 KV 读 N 遍）；Cascade 把"对公共前缀的 attention"合并成一次 kernel call（前缀 KV 读 1 遍），再与各请求独有后缀的 attention 用 LSE 合并。前者结果和后者**逐 bit 等价**——Cascade 是纯性能优化、零精度损失。注意 prefix caching（[模块 02](../02-paged-attention-kvcache/design.md)）已让前缀 KV 只**存**一份，Cascade 在此之上进一步让前缀只**算**一次。
+- **GQA/MQA vs MHA**：标准 MHA 每个 attention 头都有独立 K/V（`num_kv_heads == num_attention_heads`）；MQA=所有 query 头共享**一组** KV（最省，÷头数）；GQA=分组共享（`num_kv_heads` 介于两者间，折中、质量几乎无损）。这只改变"一个 token 的 KV 有多大"，KV manager 完全无感。GQA/MQA 与 MLA（[模块 13](../13-mla/design.md)）是"省 KV"的不同代手法（见 [PRIMER §2.4](../PRIMER.md#24-易混概念对照区别与联系专治听过但分不清)）。
+
+---
+
+### 1.4 这个模块要解决的问题
 
 标准的 full causal attention 有两条"成本曲线"随上下文增长而恶化：
 

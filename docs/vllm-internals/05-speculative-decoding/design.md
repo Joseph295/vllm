@@ -6,7 +6,45 @@
 
 ---
 
-## 1. 这个模块解决什么问题
+## 1. 背景与定位
+
+> 如果你还不清楚 **decode 为什么是访存密集（memory-bound）、一次 forward 多算几个 token 几乎不增加耗时** 这些前置直觉，请先读 [PRIMER 第一部分](../PRIMER.md#第一部分llm-推理服务-101先建立心智模型)（尤其 §1.4），这里默认你已经有了那套心智模型。
+
+### 1.1 这个模块在系统里的位置
+
+投机解码是叠加在「调度 + KV + 采样」三层之上的一层**纯加速机制** —— 它不改变最终输出（数学上保证与不用投机时逐 token 采样 target 完全一致），只让 decode 阶段一步多吐几个 token。
+
+- **上游**：调度器（[模块 01](../01-scheduler-batching/design.md)）把上一步 proposer 提议的 `k` 个 draft token 当作"已追加未确认"的 token 一起推进，并经 KV 管理器（[模块 02](../02-paged-attention-kvcache/design.md)）为它们预留 KV slot。
+- **本模块**：在 `GPUModelRunner` 的一次 forward 里，**target 模型一次性验证**这 `k` 个 draft（外加一个 bonus 位置），用**拒绝采样**决定接受几个；同时 proposer 为下一步提议新的 `k` 个 draft。
+- **下游**：采样器（[模块 06](../06-sampling-structured-output/design.md)）提供 bonus token 的完整采样和拒绝采样的纠正分布；调度器在 `update_from_output` 里按"实际接受了几个"回退 `num_computed_tokens` 的记账。
+
+一句话：**它是 decode 热路径上的一个可选加速层，靠"猜 + 一次验证"摊薄访存成本，且严格无损。**
+
+### 1.2 关键文件与类各干什么（先认人）
+
+| 文件 / 类 | 主要作用（一句话） |
+|---|---|
+| `config.py` 的 `SpeculativeConfig` | 投机解码总配置：选哪种 proposer（`method`）、猜几个（`num_speculative_tokens` 即 `k`）、接受方法等 |
+| `v1/spec_decode/ngram_proposer.py` 的 `NgramProposer` | 无模型 proposer：在已有上下文里用 KMP 找重复 n-gram、复制其后 `k` 个 token 当提议 |
+| `v1/spec_decode/eagle.py` 的 `EagleProposer` | 轻量 draft head proposer：复用 target 的 embedding/lm_head，自回归跑 `k` 步生成 draft |
+| `v1/spec_decode/metadata.py` 的 `SpecDecodeMetadata` | 验证所需的全部索引与张量（哪些位置是 draft、哪些是 bonus） |
+| `v1/sample/rejection_sampler.py` 的 `RejectionSampler` | 验证核心：4 个 Triton 内核实现"逐位置 accept/reject + 修正分布重采" |
+| `v1/worker/gpu_model_runner.py` 的 `GPUModelRunner` | 投机解码的整合处：选 proposer、算验证元数据、一次 forward 验证 + 为下一步提议 |
+| `v1/core/sched/scheduler.py` 的 `Scheduler` | 把 draft 当待验证 token 调度、预留 KV slot、被拒时回退记账 |
+| `v1/spec_decode/metrics.py` 的 `SpecDecodingMetrics` | 统计并打印接受率（投机解码是否划算的第一指标） |
+
+### 1.3 和相似模块 / 概念的区别与联系（专治"听过但分不清"）
+
+- **proposer(draft) vs target**：**proposer（也叫 draft）** 是"便宜的猜测者" —— 它快但不准，提议未来 `k` 个 token；**target** 是用户真正要的那个"贵模型" —— 它准但慢，一次 forward 验证这 `k` 个猜测。关键：proposer 只影响**接受率（速度）**，不影响**最终分布（正确性）**，所以 draft 可以随便简化（只用 temperature），正确性全压在 target 验证 + 拒绝采样这一关上。
+- **ngram vs eagle vs draft-model（三类 proposer，最容易混）**：**ngram** 不用任何模型，纯在上下文里找字面重复（零成本，但只在高重复文本里有效）；**eagle** 是一个轻量 draft head，复用 target 的特征与 lm_head（低成本、接受率稳定高，通用首选）；**draft-model** 是一个完整的独立小 LLM（成本可观，需有同族小模型）。取舍主线：proposer 越重→提议越准→但每步开销越大（详见 §3.2）。
+- **bonus token**：target 验证 `k` 个 draft 时会**顺手多算一个位置**的 logits（假设 `k` 个全被接受后再往后一格）。只有当 `k` 个 draft **全部 accept** 时，这个白送的 token 才被追加 —— 所以一步最多前进 `k+1` 个 token。它单独用完整采样器采（可享 top_p/top_k），不走拒绝采样内核（详见 §3.4）。
+- **拒绝采样（rejection sampling） vs 普通采样**：**普通采样**（[模块 06](../06-sampling-structured-output/design.md)）是"从一个分布里采一个 token"；**拒绝采样**是投机解码特有的"验证"步 —— 逐位置比较 draft 分布 `q` 与 target 分布 `p`，按 `min(1, p/q)` 概率接受 draft，拒绝处从修正分布 `max(0, p−q)` 重采。它的数学保证是"无论 draft 多差，输出都服从 target 分布"（详见 §3.3），这正是"无损加速"的来源。
+
+> decode 为何 memory-bound、continuous batching 等更基础的概念见 [PRIMER 第一部分](../PRIMER.md#第一部分llm-推理服务-101先建立心智模型) 与 [§2.4 易混对照](../PRIMER.md#24-易混概念对照区别与联系专治听过但分不清)。
+
+---
+
+### 1.4 这个模块要解决的问题
 
 LLM 自回归 decode 有两个根本痛点：
 
@@ -51,6 +89,8 @@ LLM 自回归 decode 有两个根本痛点：
 - 若 `k` 个全 accept，则 `k` 个 accept + 1 个 **bonus token**（target 在第 `k+1` 位置本来就算了 logits，白送），共 `k+1` 个 token。
 
 所以每步**至少前进 1 个 token**（最坏情况第一个 draft 就被拒，等价于普通 decode 一步），**最多前进 k+1 个**。这就是加速的来源。
+
+> 🔗 **回扣[贯穿示例](../PRIMER.md#第三部分一个贯穿全文的玩具示例强烈建议先看懂这个)**：示例的阶段⑤（decode 第 1 步）原本是"只算 1 个 token id=9"。若对它开投机解码、设 `k=3`：proposer 先猜出 3 个 draft token，target 把 `[当前token, draft1, draft2, draft3]` 拼进序列**一次 forward** 算出 4 个位置的 logits，拒绝采样逐位置验证 —— 若 3 个全对就一步前进 4 个 token（3 accept + 1 bonus），而不是慢悠悠一步一个。这就是把示例里"挤牙膏"的 decode 变成"一次走几格"。
 
 ### 3.2 Proposer 谱系：ngram / eagle / draft model 的取舍
 

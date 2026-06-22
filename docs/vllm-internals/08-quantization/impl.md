@@ -21,11 +21,11 @@
 weight-only 方法（W4A16/W8A16）
   ├─ gptq.py / gptq_marlin.py   # GPTQ（exllama）/ GPTQ-Marlin
   ├─ awq.py / awq_marlin.py     # AWQ / AWQ-Marlin
-  ├─ marlin.py / gptq_marlin_24.py
+  ├─ marlin.py / gptq_marlin_24.py  # 纯 Marlin 方法 / 2:4 稀疏 Marlin
   ├─ kernels/mixed_precision/   # MPLinearKernel + choose_mp_linear_kernel
   │    ├─ __init__.py           #   _POSSIBLE_KERNELS 优先级表
   │    ├─ MPLinearKernel.py     #   抽象基类 + MPLinearLayerConfig
-  │    ├─ marlin.py machete.py exllama.py allspark.py
+  │    ├─ marlin.py machete.py exllama.py allspark.py  # 四个 weight-only kernel 子类的封装
   └─ utils/marlin_utils.py      # 权重/scale/zp 重排（Tensor-Core 布局）
 
 W8A8 / FP8 方法
@@ -50,6 +50,8 @@ kernel Python 绑定
 
 ### 阶段 A：启动期 —— 解析 quant 方法、运行时升级 kernel
 
+> **这一步在干嘛**：开机先看 checkpoint 自带的量化配置（是 gptq？awq？fp8？），并**自动把它升级成更快的 kernel**——比如下载的是普通 gptq 模型，vLLM 会偷偷换成 gptq_marlin kernel 跑同一份权重，用户无感、速度更快。
+
 **A1.** `vllm/config.py:732` `ModelConfig._verify_quantization()`
 - `:733` `supported_quantization = QUANTIZATION_METHODS`。
 - `:743` `_parse_quant_hf_config()`（`:725-730`）：从 `hf_config.quantization_config` 或 `compression_config` 读出 checkpoint 自带的量化配置。
@@ -73,6 +75,8 @@ kernel Python 绑定
 
 ### 阶段 B：实例化 QuantizationConfig
 
+> **这一步在干嘛**：把上一步定下来的方法名（如 `gptq_marlin`）变成一个真正的配置对象——按方法名找到对应的类，从 checkpoint 里读出 bits/group_size/scale 策略等字段，`from_config` 造出实例，并校验当前 GPU 算力够不够跑这种量化。
+
 **B1.** `vllm/model_executor/model_loader/weight_utils.py:143` `get_quant_config()`
 - `:146` `quant_cls = get_quantization_config(model_config.quantization)`（名→类，走 `quantization/__init__.py:78`）。
 - `:153-162` 取出 `hf_config.quantization_config`（或 vision 模型的 `text_config.quantization_config`、或 `compression_config`）。
@@ -89,6 +93,8 @@ kernel Python 绑定
 - 存进 `VllmConfig.quant_config`（字段 `config.py:3604`，`__post_init__` 赋值 `:3776-3778`），随后 `loader.py:125 configure_quant_config(...)` 给它注入 `packed_modules_mapping`，并把整个 `vllm_config` 传给模型构造（`loader.py:133`）。
 
 ### 阶段 C：构造模型 —— 每层选择 quant_method（无侵入替换发生处）
+
+> **这一步在干嘛**：搭模型时，每构造一个 Linear/MoE/Attention 层，就问那个量化配置对象"这一层该用什么量化策略"，把返回的 method 存进该层。模型代码本身只写 `RowParallelLinear(...)`，对量化**毫无感知**——量化就这样被"插"进了每一层。
 
 **C1.** `vllm/model_executor/layers/linear.py:207` `LinearBase.__init__()` —— **★最关键的插件替换点**
 ```python
@@ -121,6 +127,8 @@ if quant_method is not None and not isinstance(quant_method, UnquantizedLinearMe
 
 ### 阶段 D：① create_weights —— 注册量化布局参数
 
+> **这一步在干嘛**：给这一层登记"量化版的权重盒子"——不再是一个 `[out,in]` 的 FP16 weight，而是 `qweight`(打包的 int32) + `scales` + `qzeros` 等若干 buffer。这些盒子用带元数据的特殊 `Parameter`，好让加载器知道 TP 并行下每个 rank 该切哪一块。
+
 **D1.** weight-only（GPTQ-Marlin）：`gptq_marlin.py:210` `create_weights()`
 - `:224-235` 组装 `MPLinearLayerConfig` 并 `choose_mp_linear_kernel(...)` 选 kernel 类（Marlin/Machete/…）。
 - `:249-260` **TP 下 scale 切分判定**：`marlin_repeat_scales_on_all_ranks(desc_act, group_size, is_row_parallel)` 为真则 `scales_and_zp_input_dim=None`（各 rank 复制完整 scale），否则 `=0`（沿输入维切分）。
@@ -135,9 +143,13 @@ if quant_method is not None and not isinstance(quant_method, UnquantizedLinearMe
 
 ### 阶段 E：weight_loader —— 加载并按 TP 切分权重与 scale
 
+> **这一步在干嘛**：把 checkpoint 里的量化权重真正读进上一步建好的盒子，并在张量并行下**按 rank 切分**。关键细节：scale 要不要跟着切，由参数的元数据决定（group-wise scale 沿输入维切，per-tensor 标量复制不切）。
+
 权重从 checkpoint 流入时，`ColumnParallelLinear.weight_loader`（`linear.py:419`）沿 `output_dim` 切，`RowParallelLinear.weight_loader`（`linear.py:1193`）沿 `input_dim` 切。**scale 是否跟着切**由 vLLM `Parameter` 子类的元数据决定：`GroupQuantScaleParameter` 带 `input_dim` → 沿输入维切；`PerTensorScaleParameter`（0 维标量）→ 复制不切（`linear.py:451-454` 的标量特例处理 AutoFP8）。这正是 D1 里 `scales_and_zp_input_dim` 的意义落地处。
 
 ### 阶段 F：② process_weights_after_loading —— 一次性重排/重量化（性能关键）
+
+> **这一步在干嘛**：权重加载完后**做一次性的"摆盘"**——把 checkpoint 的通用布局重排成特定 kernel 要的布局（Marlin 的 Tensor-Core 交错布局、FP8 的转置+合并 scale 等）。这是性能的关键：重排一次贵一点，但换 forward 时量化权重直流 MMA、零额外 reshuffle。
 
 **F1.** 调用点：`vllm/model_executor/model_loader/loader.py:164` `_process_weights_after_loading()`
 ```python
@@ -174,6 +186,8 @@ MLA 的 `Attention` 模块在 `:185-190` 单独处理（晚于其他模块，便
 
 ### 阶段 G：③ apply —— forward 热路径
 
+> **这一步在干嘛**：真正算这一层的地方。weight-only 走"边读 int4 边反量化、直入 MMA"（或大 batch 时先全反量化成 FP16 再普通 GEMM）；W8A8/FP8 则**先把激活也量化**，让 GEMM 两个操作数都是低精度、走低精度 Tensor Core，最后用 scale 反量化回 FP16。
+
 forward 统一经 `linear.py:321/474/1258` 的 `self.quant_method.apply(self, x, bias)` 触发。
 
 **G1.** GPTQ-Marlin：`gptq_marlin.py:338` `apply()` → `self.kernel.apply_weights(layer, x, bias)` → `kernels/mixed_precision/marlin.py:110` → **`apply_gptq_marlin_linear`**（`marlin_utils.py:324`）：
@@ -199,6 +213,8 @@ else:
 > 这就是 W8A8 与 weight-only 的代码级区别：**激活在这里也被 `scaled_fp8_quant` 量化**，GEMM 两个操作数都是 FP8。
 
 ### 阶段 H：FP8 KV cache 在 attention backend 的读写
+
+> **这一步在干嘛**：KV cache 量化是另一条线——它不走上面的 `apply`，而在 attention backend 里发生：把要写进 KV cache 的 k/v 用 `_k_scale`/`_v_scale` 量化成 FP8 存进去，读的时候再用 descale 反量化回来。好处是 KV 容量翻倍、能跑更长上下文/更大并发。
 
 KV 量化不走 `apply`（`kv_cache.py:42` 的 `apply` 直接 raise），而在 attention backend 里用 `layer._k_scale/_v_scale/_q_scale`（paged KV 读写 / `reshape_and_cache` 的总体机制见 [模块 02](../02-paged-attention-kvcache/design.md)）。
 

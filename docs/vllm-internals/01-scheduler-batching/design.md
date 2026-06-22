@@ -6,7 +6,41 @@
 
 ---
 
-## 1. 这个模块解决什么问题
+## 1. 背景与定位
+
+> 如果你还不清楚 **prefill/decode、KV cache、continuous batching** 这些前置概念，请先读 [PRIMER 第一部分](../PRIMER.md#第一部分llm-推理服务-101先建立心智模型)，这里默认你已经有了那套心智模型。
+
+### 1.1 这个模块在系统里的位置
+
+调度器是 EngineCore 主循环 `step()` 三段式（`schedule → execute → update`）里的**第一段**，只做"**决策**"，不碰 GPU：
+
+- **上游**：EngineCore 收到新请求后丢进调度器的 `waiting` 队列（见 [模块 00](../00-request-lifecycle/design.md)）。
+- **本模块**：每一步决定"这一步对**哪些请求**、各算**多少 token**、用**哪些 KV block**"，产出一个纯数据对象 `SchedulerOutput`。
+- **下游**：`SchedulerOutput` 交给 Executor 下发到 GPU 执行（见 [模块 03](../03-distributed-parallel/design.md)），结果再回到本模块的 `update_from_output()` 回填。
+
+一句话：**它是吞吐与延迟的总阀门，是个"只动脑、不动手"的纯 CPU 决策器。**
+
+### 1.2 关键文件与类各干什么（先认人）
+
+| 文件 / 类 | 主要作用（一句话） |
+|---|---|
+| `sched/scheduler.py` 的 `Scheduler` | 调度主体：`schedule()` 决定这步算什么、`update_from_output()` 把执行结果回填并检测请求是否结束 |
+| `sched/interface.py` 的 `SchedulerInterface` | 调度器的抽象接口，定义 `schedule/update/add_request` 等方法，使调度策略可替换 |
+| `sched/output.py` 的 `SchedulerOutput` / `NewRequestData` / `CachedRequestData` | 调度的**产物**——纯数据，描述"这步算什么"，不含任何 GPU 逻辑 |
+| `sched/utils.py` 的 `check_stop` | 判断一条请求是否该停（命中 EOS / 达长度上限 / 命中 stop string） |
+| `request.py` 的 `Request` / `RequestStatus` | 单条请求的**状态机**：`WAITING → RUNNING ⇄ PREEMPTED → FINISHED` |
+| `KVCacheManager`（属 [模块 02](../02-paged-attention-kvcache/design.md)） | 调度器每要调度一个请求，都问它"**放不放得下**"；真正的显存账本在那边 |
+
+### 1.3 和相似模块 / 概念的区别与联系（专治"听过但分不清"）
+
+- **调度器 vs Executor**：调度器**动脑**（算什么），Executor（[模块 03](../03-distributed-parallel/design.md)）**动手**（去 GPU 算）。调度器产出纯数据、可单测、不依赖 GPU——这是 V1 能把调度和执行解耦（进而做 PP 流水线）的前提。
+- **chunked prefill vs prefix caching**：本模块负责**前者**（把长 prefill 切片、与别人的 decode 混批）；**后者**（复用相同前缀已算好的 KV）由 [模块 02](../02-paged-attention-kvcache/design.md) 实现，调度器只是"查到命中就把那些 token 直接计入 `num_computed_tokens`、跳过计算"。两者都让 prefill 变便宜，但一个**切自己**、一个**蹭现成**。
+- **抢占（preempt）vs 交换（swap）**：显存不足时，V1 只做"**重计算式抢占**"（丢弃 KV、退回 `waiting` 重算）；V0 还有 **swap-to-CPU**（把 KV 换到内存再换回），V1 实测重算通常更快、更简单，故砍掉。
+- **continuous batching vs 静态 batching**：见 [PRIMER §2.4](../PRIMER.md#24-易混概念对照区别与联系专治听过但分不清)。**本模块就是 continuous batching 的落地处**——逐 token 调度、谁完谁退、随到随加。
+
+---
+
+### 1.4 这个模块要解决的问题
 
 LLM 推理有一个根本的不对称：**prefill 是计算密集（compute-bound）**——一次把整个 prompt 的所有 token 并行算完，GPU 算力打满；**decode 是访存密集（memory-bound）**——每步只算 1 个新 token，但要把全部 KV cache 从显存搬一遍，算力大量闲置。
 

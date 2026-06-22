@@ -6,7 +6,44 @@
 
 ---
 
-## 1. 这个模块解决什么问题
+## 1. 背景与定位
+
+> 如果你还不清楚 **prefill/decode、CUDA graph、torch.compile** 这些前置概念，建议先读 [PRIMER 第一部分](../PRIMER.md#第一部分llm-推理服务-101先建立心智模型)（尤其 1.4 "为什么 decode 是 memory-bound"），下面会把本模块特有的几个概念从零讲一遍。
+
+### 1.1 这个模块在系统里的位置
+
+本模块是一个**横切优化**，不改变"算什么"，只改变"怎么把 forward 跑得更快"。它夹在执行链路的最里层：
+
+- **上游**：调度器（[模块 01](../01-scheduler-batching/design.md)）决定这一步算哪些 token，`execute_model`（[模块 00](../00-request-lifecycle/design.md)）准备好输入。
+- **本模块**：在 `execute_model` 调模型 `forward` 时介入——启动期把 forward 编译成融合 kernel、把"除 attention 外的静态计算"录成 CUDA graph；运行期把实际 batch **pad 到最近的捕获档**，然后 `replay` 录好的 graph，attention 段则仍走 eager。
+- **下游**：forward 产出 hidden states，交给采样（[模块 06](../06-sampling-structured-output/design.md)）。
+
+一句话：**它是 forward 的"加速外壳"——对调度、KV 管理、采样都透明，唯独和 attention backend（[模块 02](../02-paged-attention-kvcache/design.md)）强耦合（attention 必须留在 graph 外）。**
+
+### 1.2 关键文件与类各干什么（先认人）
+
+| 文件 / 类 | 主要作用（一句话） |
+|---|---|
+| `compilation/decorators.py` 的 `@support_torch_compile` | 类装饰器：把模型的 `forward` 包成"可编译类"，是整条编译路径的入口 |
+| `compilation/wrapper.py` 的 `TorchCompileWrapperWithCustomDispatcher` | 真正调 `torch.compile(forward, backend=...)` 的包装层 |
+| `compilation/backends.py` 的 `VllmBackend` | level-3 的 torch.compile 后端：**按 attention 把整图切成多段**，驱动分段编译 |
+| `compilation/backends.py` 的 `PiecewiseBackend` | 每个**静态段**的运行期后端：管该段"按 size 编译 + 录 CUDA graph + replay" |
+| `forward_context.py` 的 `ForwardContext` / `set_forward_context` | 把 `attn_metadata` 等"不能当 graph 输入的运行期信息"旁路传给图外的 attention |
+| `config.py` 的 `CompilationConfig` / `pad_for_cudagraph` | 编译总配置 + 运行期 O(1) 把 batch size pad 到最近捕获档 |
+| `v1/worker/gpu_model_runner.py` | 持久 buffer / `execute_model`(pad) / `_dummy_run` / `capture_model` 的集成处 |
+| `attention/layer.py` 的 `unified_attention` custom op | attention 被封成 custom op，作为"切图点"——它留在 CUDA graph 外 |
+
+### 1.3 和相似模块 / 概念的区别与联系（专治"听过但分不清"）
+
+- **torch.compile vs CUDA graph**：两者解决**不同层**的开销，叠加使用。**torch.compile**（Dynamo 抓图 + Inductor 编译）砍的是 **Python/框架开销**——把逐层走 Python 的 forward 变成一张融合好的 kernel 图；**CUDA graph** 砍的是 **kernel launch 开销**——把"一串 GPU 操作"录下来、之后用一条 `replay()` 指令整体重放，CPU 几乎不参与。一句话：**torch.compile 让 kernel 更少更融合，CUDA graph 让"发射 kernel 这件事"几乎免费。**
+- **capture（捕获）vs replay（重放）**：**capture** 是启动期一次性的"录制"——把某个固定 batch size 下实际执行的 kernel 序列录进一张 `CUDAGraph` 对象；**replay** 是运行期热路径上的"播放"——直接重放录好的那串 kernel，不再走 Python、不再逐个 launch。录一次、放千万次，这是 CUDA graph 省开销的根本。
+- **piecewise（分段）cudagraph vs 整图 cudagraph**：V0 把**整个 forward（含 attention）**录成一张图，但 attention 要读变长序列、动态寻址 paged KV，违反 CUDA graph"固定 shape + 固定地址 + 无 data-dependent 控制流"的铁律，导致只能对很窄的纯 decode 场景开图。V1 的 **piecewise** 把图**按 attention 算子切开**：attention 之间的静态段各录一张 graph、attention 段留在图外走 eager。**整图=简单但覆盖窄，piecewise=复杂但 prefill/decode/混批都能部分 replay。**
+- **eager vs 编译**：**eager** = PyTorch 默认的"逐算子即时执行"，每个算子走一遍 Python 和 dispatcher，灵活但慢；**编译/捕获**后热路径只剩"查表 + replay"。`enforce_eager=True` 是一键退回纯 eager 的逃生口（调试、不支持的硬件、超长序列时用）。
+- **本模块 vs 量化（[模块 08](../08-quantization/design.md)）/ LoRA（[模块 09](../09-lora/design.md)）**：三者都是叠加在 forward 上的横切关注点，但本模块管"整段计算怎么编译/重放"，量化管"某层权重怎么存、怎么算"，LoRA 管"基座之上挂多大增量"。量化层和 LoRA 层都必须**能被本模块编译、能进 cudagraph**（固定地址 buffer + 可被 Dynamo 追踪），这是它们之间的隐形契约。
+
+---
+
+### 1.4 这个模块要解决的问题
 
 LLM 推理 decode 阶段的一个反直觉事实：**当 batch 很小（比如 1~8 条序列各生成 1 个 token）时，GPU 算得飞快，瓶颈反而在 CPU**。
 

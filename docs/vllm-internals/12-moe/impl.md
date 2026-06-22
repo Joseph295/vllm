@@ -47,6 +47,8 @@ CUDA kernel csrc/moe/
 
 ### 阶段 A：模型层 —— 算 router logits、并排 shared expert
 
+> **这一步在干嘛**：在模型层里，先用一个小 Linear（gate）算出每个 token 对各专家的「偏好分数」（router logits）；DeepSeek 这类还在旁边并排放一个**共享专家**（普通 MLP，对所有 token 都激活，承载通用知识）。这一步还没选专家、没算路由专家，只是把「打分」和「共享专家输出」准备好。
+
 **A1.** `vllm/model_executor/models/deepseek_v2.py:157` `DeepseekV2MoE.forward`
 ```python
 router_logits, _ = self.gate(hidden_states)          # gate: ReplicatedLinear hidden→n_routed_experts
@@ -78,6 +80,8 @@ self.experts = FusedMoE(num_experts=config.n_routed_experts, top_k=config.num_ex
 
 ### 阶段 B：FusedMoE.forward —— 入口与 DP multicast
 
+> **这一步在干嘛**：进 `FusedMoE` 层的总入口。单 DP 时直接往下走；多 DP 时要先把各 DP rank 的 token 聚到一起（因为专家计算要跨 DP 把 token 凑齐），算完再 all-reduce、切回本 rank。这里还决定 all-reduce 在哪做——DeepSeek 设 `reduce_results=False`，把 all-reduce 推迟到模型层和共享专家合并后只做一次。
+
 **B1.** `layer.py:839` `FusedMoE.forward`
 ```python
 if self.use_direct_call:                            # dp_size == 1
@@ -96,6 +100,8 @@ else:
 ---
 
 ### 阶段 C：① 路由 —— select_experts
+
+> **这一步在干嘛**：把 router 算出的分数变成实打实的「每个 token 去哪 top-k 个专家、各占多大门控权重」。三种打分/选择策略走同一个入口：Mixtral 的 softmax-topk、DeepSeek 的「先选组再选专家 + sigmoid 打分 + 负载均衡偏置」、Llama4/Phi 的自定义路由。输出就两个张量：`topk_ids`（选中的专家 id）和 `topk_weights`（门控权重）。
 
 **C1.** `layer.py:199` `UnquantizedFusedMoEMethod.forward_cuda`（量化方法的 apply 同构）调：
 ```python
@@ -143,6 +149,8 @@ if e_score_correction_bias is not None:
 
 ### 阶段 D：② 对齐分块 —— moe_align_block_size（题眼）
 
+> **这一步在干嘛**：这是整个模块的题眼。路由完手上是「专家 A 有 37 个 token、专家 B 有 5 个」这种**变长锯齿**形状，GPU 的 GEMM kernel 吃不下。这一步把所有 token **按所属专家排序**、每个专家尾部补 padding 对齐到 `block_size` 的整数倍，产出两个张量：`sorted_token_ids`（排好序的 token 行布局）和 `expert_ids`（每个 block 属于哪个专家——grouped GEMM 的「权重选择器」）。从此 kernel 眼里就是规整的 tile，完全不知道路由原本是动态的。EP 时还顺手把全局专家 id 经 `expert_map` 重映射成本地 id（非本卡变 -1）。
+
 由 `fused_experts_impl` 在每个 chunk 内调用（见 E2）：
 
 **D1.** `moe_align_block_size.py:151` `moe_align_block_size(topk_ids, block_size, num_experts, expert_map)`
@@ -170,6 +178,8 @@ if e_score_correction_bias is not None:
 ---
 
 ### 阶段 E：③ 专家 grouped GEMM —— fused_experts → fused_experts_impl
+
+> **这一步在干嘛**：真正的专家计算——**两段 grouped GEMM 夹一个激活**。① 第一段 GEMM 用 `expert_ids` 给每个 token 块选对专家的 `w13` 权重算 gate+up；② `silu_and_mul` 激活；③ 第二段 GEMM 算 `w2`（down），并在这里把门控权重乘上去；④ 把每个 token 的 top-k 个专家输出加权求和成一行。全程一个融合 triton kernel 用 `expert_ids[block]` 切权重、一次 launch 算完所有专家；非本卡专家（EP）的块直接输出写 0。
 
 **E1.** `layer.py:211` `forward_cuda` 调 `fused_experts(...)`（`fused_moe.py:1111`）
 - `:1134-1151` 若 `allow_deep_gemm and use_fp8_w8a8 and _valid_deep_gemm(...)`：转 `deep_gemm_moe_fp8`（见 §4）。
@@ -228,6 +238,8 @@ if e_score_correction_bias is not None:
 ---
 
 ### 阶段 F：combine 回模型层 —— shared 相加 + 单次 all-reduce
+
+> **这一步在干嘛**：路由专家算完回到模型层，把它的输出（按 `routed_scaling_factor` 缩放）和阶段 A 算好的共享专家输出**相加**，因为两者各自都设了 `reduce_results=False`、都没 all-reduce，这里合并后**只做一次** all-reduce 就够（all-reduce 对加法可分配）——省一次跨卡集合通信。最后得到这一层的 `final_hidden_states`，接回 decoder 下一层。
 
 回到 `deepseek_v2.py:159-177`：
 ```python

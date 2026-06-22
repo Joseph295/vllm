@@ -39,6 +39,8 @@ V1 集成          vllm/v1/worker/
 
 ### 阶段 A：配置阶段 —— 决定开不开、捕获哪些 size
 
+> **这一步在干嘛**：开机时先拍板"这次跑要不要编译/录图、要给哪几个 batch size 各录一张图"。把切图点设成 attention、把要捕获的 size 列表算好、把"任意 batch size 该 pad 到哪一档"的查找表预先建好——后面运行期就只查表不算账。
+
 **A1.** `vllm/config.py:3794` `VllmConfig.__post_init__`（PIECEWISE 强制开启）
 ```python
 if envs.VLLM_USE_V1 and self.model_config is not None and \
@@ -88,6 +90,8 @@ self.positions = torch.zeros(self.max_num_tokens, dtype=torch.int64, device=self
 
 ### 阶段 B：load_model —— 把模型 forward 包成"可编译类"
 
+> **这一步在干嘛**：加载模型时，给模型类"套一层壳"——把它的 `forward` 用 `torch.compile` 包起来。注意这里只是**包好待命**，还没真编译（torch.compile 是惰性的，要等第一次真跑 forward 才触发）。
+
 **B1.** `gpu_model_runner.py:1278` `load_model` → `get_model(...)`：构造模型。被 `@support_torch_compile` 装饰的模型类（如各 `*Model`）此时混入编译能力。
 
 **B2.** `decorators.py:38` `support_torch_compile`（类装饰器）
@@ -108,6 +112,8 @@ compiled_callable = torch.compile(self.forward,
 ---
 
 ### 阶段 C：第一次 forward —— Dynamo 抓图 + 切图 + 分段编译
+
+> **这一步在干嘛**：第一次真跑 forward 时编译才真正发生：Dynamo 把整个 forward 抓成一张图，再**按 attention 这个切点把整图切成"静态段 | attention | 静态段 | ..."**，把每个静态段交给 Inductor 编译成融合 kernel。这一步只编译、**不录 CUDA graph**。
 
 由 §2 阶段 D 的 `compile_or_warm_up_model` → `_dummy_run` 触发。第一次调用被装饰模型的 `__call__`：
 
@@ -156,6 +162,8 @@ PiecewiseCompileInterpreter(self.split_gm, submod_names_to_compile,
 ---
 
 ### 阶段 D：compile_or_warm_up_model —— warmup 与 capture 的编排
+
+> **这一步在干嘛**：编排"先编译/预热、再录图"这件事的总指挥。先把各 size 编译好、跑几次 warmup（让 cuBLAS/Inductor 的惰性初始化、autotune 都在录制**之前**发生完），然后才进 `capture_model` 从大到小逐个 size 把静态段录成 CUDA graph。顺序铁律：**先 compile 再 capture，绝不能反**。
 
 **D0.** 调用入口：`v1/executor/abstract.py:65` `collective_rpc("compile_or_warm_up_model")`（在 `initialize_from_config` 里，KV cache 初始化之后）。
 
@@ -230,6 +238,8 @@ if entry.cudagraph is None:                          # :640 还没录 → 先 wa
 ---
 
 ## 3. 运行期调用链：pad → replay
+
+> **这一步在干嘛**：每一步 decode 的热路径，已经没有任何编译了。把这步真实的 token **写进固定地址的持久 buffer**，把实际 batch size **pad 到最近的捕获档**（O(1) 查表），然后逐段执行——静态段 `replay()` 录好的 graph、attention 段走 eager 读 paged KV，最后把 pad 多算的尾巴丢掉。**一句话：查表 → replay，CPU 几乎不干活。**
 
 入口：[模块 00](../00-request-lifecycle/impl.md) 的 `EngineCore.step` → executor → `gpu_worker.py:242` → `gpu_model_runner.py:987` `execute_model`。
 

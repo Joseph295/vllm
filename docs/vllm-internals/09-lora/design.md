@@ -6,7 +6,44 @@
 
 ---
 
-## 1. 这个模块解决什么问题
+## 1. 背景与定位
+
+> 一句话先垫底：**LoRA = 给基座大模型挂一个小的低秩增量（W+BA），多个租户共享同一份底座、各挂各的适配器。** 本模块讲清"多 LoRA 怎么在同一个 batch 内并行算完"和"成百上千适配器怎么在 CPU/GPU 间动态换入换出"。前置的 continuous batching 概念见 [PRIMER §2.4](../PRIMER.md#24-易混概念对照区别与联系专治听过但分不清)。
+
+### 1.1 这个模块在系统里的位置
+
+LoRA 是一个**横切关注点**，叠加在多个核心模块之上：
+
+- **调度层**（[模块 01](../01-scheduler-batching/design.md)）：调度器组 batch 时要保证"同一步里出现的不同 LoRA 数 ≤ `max_loras`"（GPU 槽位数）——这就是 `max_loras` 既是显存约束又是调度约束的原因。
+- **本模块**：启动期把被适配的 Linear/Embedding/Logits 层换成 `*WithLoRA` 包装层、预分配 GPU stacked 权重；每 batch 构建 token→lora 的 mapping 并把热的适配器激活到 GPU 槽位；forward 时用 Punica kernel 把"基座大 GEMM"和"多 LoRA 增量"分开算。
+- **执行层**（[模块 00](../00-request-lifecycle/impl.md) 阶段 F）+ **CUDA graph**（[模块 07](../07-cuda-graph-compile/design.md)）：LoRA 的 kernel 必须能被 graph capture，权重 buffer 必须固定地址。
+
+一句话：**它是叠在基座 forward 之上的"多租户增量层"——基座只算一遍，每个被适配层再追加一个低秩增量。**
+
+### 1.2 关键文件与类各干什么（先认人）
+
+| 文件 / 类 | 主要作用（一句话） |
+|---|---|
+| `lora/request.py` 的 `LoRARequest` | 用户侧适配器标识：`lora_name` / `lora_int_id`（全局唯一）/ `lora_path` |
+| `lora/lora.py` 的 `LoRALayerWeights` | 单层的 LoRA 权重 `lora_a`/`lora_b`/`scaling`；`optimize()` 把 scaling 折进 `lora_b` |
+| `lora/models.py` 的 `LoRAModel` / `LoRAModelManager` | 一个完整适配器 + GPU 槽位表（`lora_index_to_id`）与双层 LRU 缓存、激活/驱逐/pin |
+| `lora/layers.py` 的 `BaseLayerWithLoRA` 及子类 | 包装基座层的 LoRA 层，持有 `lora_a_stacked`/`lora_b_stacked` GPU 张量 |
+| `lora/worker_manager.py` 的 `WorkerLoRAManager` | worker 侧入口：读盘加载适配器、`set_active_adapters`、转发到 ModelManager |
+| `lora/punica_wrapper/punica_gpu.py` 的 `PunicaWrapperGPU` | 封装 `add_lora_linear` / `add_shrink` / `add_expand`，调 Triton kernel |
+| `lora/ops/triton_ops/lora_shrink.py` / `lora_expand.py` | 分段并行的 Triton kernel：一次 launch 算完全 batch、全 LoRA 的增量 |
+| `v1/worker/lora_model_runner_mixin.py` | V1 集成：`load_lora_model` / `set_active_loras` |
+
+### 1.3 和相似模块 / 概念的区别与联系（专治"听过但分不清"）
+
+- **LoRA(W+BA) vs 全量微调**：全量微调要为每个任务存一整份 `W`（7B 模型 ~14GB），100 个任务就是 100 份；**LoRA 冻结 `W`、只训一个低秩增量 `ΔW=B·A`**（`A:[in,r]`、`B:[r,out]`，秩 `r` 通常 8~64），一个适配器只有几十 MB。代价是表达能力受秩限制，但绝大多数下游任务够用——这换来了"一份基座服务无数租户"的部署红利。
+- **多 LoRA 同 batch vs 按 LoRA 拆批**：vLLM 的吞吐来自把不同请求塞进同一个 GPU batch（continuous batching）。若请求 A 用 LoRA-1、B 用 LoRA-2、C 不用 LoRA，**朴素做法是按 LoRA 把 batch 拆开逐个跑**——会把一个大 GEMM 拆成许多瘦 GEMM、GPU 严重欠载。vLLM 坚持**基座大 GEMM 全 batch 只算一遍**，LoRA 增量用专门的分段 kernel **一次 launch 算完所有 LoRA**。
+- **SGMV vs BGMV**：都是 Punica 提出的"一次 kernel 处理多 LoRA"的批量 GEMM。**SGMV（Segmented Gather Matrix-Vector）** 面向 prefill——连续 token 往往同属一个 LoRA，于是把 batch 按 LoRA **分段**、每段一个连续 token 区间、在 grid 的一维上并行各段；**BGMV（Batched ...）** 面向 decode——每请求每步只 1 个 token，逐 token gather 对应权重。vLLM V1 用统一的 Triton `lora_shrink`/`lora_expand`，prefill/decode 共用同一套 kernel。
+- **base 权重 vs adapter**：**base（基座）权重** `W` 是冻结的、全租户共享、只加载一份、只算一遍；**adapter（适配器）** 是每租户各自的 `A`/`B`，按请求动态挂载，存活在"磁盘→CPU→GPU"三层缓存里。vLLM 刻意**不把 `ΔW` merge 进 `W`**——merge 会让每个请求的权重各不相同、砸掉基座共享的全部价值。
+- **本模块 vs 量化（[模块 08](../08-quantization/design.md)）/ 编译（[模块 07](../07-cuda-graph-compile/design.md)）**：三者都是横切关注点。LoRA 叠在基座层之上、量化决定基座层权重怎么存、编译决定整段 forward 怎么 replay。LoRA 的 GPU 权重必须 stacked 静态预分配（固定地址），正是为了和 CUDA graph 兼容。
+
+---
+
+### 1.4 这个模块要解决的问题
 
 LoRA（Low-Rank Adaptation）是当下最主流的参数高效微调（PEFT）方式：冻结基座权重 `W`，只训练一个低秩增量 `ΔW = B·A`（`A`、`B` 是两个瘦长矩阵，秩 `r` 通常 8~64）。一个 7B 模型的全量微调要存一整份 ~14GB 权重，而一个 LoRA 适配器往往只有几十 MB。
 

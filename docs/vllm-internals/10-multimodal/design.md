@@ -5,7 +5,45 @@
 
 ---
 
-## 1. 这个模块解决什么问题
+## 1. 背景与定位
+
+> 如果你还不清楚 **prefill/decode、KV cache、continuous batching、chunked prefill、prefix caching** 这些前置概念，请先读 [PRIMER 第一部分](../PRIMER.md#第一部分llm-推理服务-101先建立心智模型)，这里默认你已经有了那套心智模型。
+
+### 1.1 这个模块在系统里的位置
+
+多模态是横跨**前端 → 调度 → 执行**三段的一条纵向分支——它不是某一处的独立组件，而是在每一段里都给「纯文本」流程叠加了「图像/音频」的处理：
+
+- **上游（前端 P0）**：用户发来的不只是文本，还有 PIL 图像 / 音频波形。前端的 merged processor 把它们 tokenize 成「文本 token + 一段图像**占位 token**」，并把重像素张量按 hash 决定是否过界（见 [模块 00](../00-request-lifecycle/design.md)）。
+- **本模块（调度 + 执行）**：调度器额外受 **encoder budget / encoder cache** 双约束（叠加在 [模块 01](../01-scheduler-batching/design.md) 的 token budget 主框架上）；执行层先跑一遍 vision/audio encoder 把图像变成 embedding，再 scatter 进 decoder 的输入嵌入。
+- **下游**：encoder 产出的 embedding 填进序列后，对 attention / KV cache（[模块 02](../02-paged-attention-kvcache/design.md)）而言「视觉 token」和「文本 token」就一视同仁了。
+
+一句话：**多模态的全部工作，就是「把图像变成一段能塞进文本序列、和文本 token 共用同一套 attention/KV 的 embedding」，并让它在 continuous batching 引擎里算得高效、缓存得合理。**
+
+### 1.2 关键文件与类各干什么（先认人）
+
+| 文件 / 类 | 主要作用（一句话） |
+|---|---|
+| `multimodal/processing.py` 的 `BaseMultiModalProcessor` | merged processor：一次完成「tokenize 文本」+「把图像展开成占位 token」+「产出对齐元数据」 |
+| `multimodal/inputs.py` 的 `PlaceholderRange` | `(offset, length, is_embed)`：一段图像在序列里占哪些位置——**所有对齐的唯一真相** |
+| `multimodal/hasher.py` 的 `MultiModalHasher` | 给每张图算一个 blake3 `mm_hash`，作为缓存/复用的身份标识 |
+| `v1/engine/mm_input_cache.py` 的 `MirroredProcessingCache` | P0/P1 两进程各持一份镜像缓存，让大像素张量「只过界一次」 |
+| `v1/core/encoder_cache_manager.py` 的 `EncoderCacheManager` | 以 token 数计容量的 encoder 输出缓存簿记（一张图的 encoder 只算一次，缓存复用） |
+| `v1/core/sched/scheduler.py` 的 `_try_schedule_encoder_inputs` | 在调度里加 encoder 双约束，决定 chunked prefill 的 chunk 边界 |
+| `v1/worker/gpu_model_runner.py` 的 `_execute_mm_encoder` / `_gather_mm_embeddings` | 执行层：跑 encoder、把 embedding 取出来 scatter 进 decoder 输入 |
+| `model_executor/models/utils.py` 的 `merge_multimodal_embeddings` | 按占位 token id 把视觉 embedding 覆盖到 input embeddings 对应行 |
+
+### 1.3 和相似模块 / 概念的区别与联系（专治"听过但分不清"）
+
+- **文本 token vs 图像占位 token**：文本 token 是真实的词表 id，过 embedding 层得到向量；图像**占位 token**（如 `<image>` 重复 N 次）只是「占位置」的假 token，其向量不来自 embedding 层、而是 vision encoder 算出来后 scatter 进去的。两者在 decoder 看来都是序列里的一个位置，attention 一视同仁——区别只在「这一行的 embedding 从哪来」。
+- **encoder cache vs KV cache**：两者都叫 cache，但存的东西完全不同。**encoder cache** 存的是 vision encoder 的**输出 embedding**（一张图算一次、等所有占位位置进了 KV 就释放，见 §3.3）；**KV cache**（[模块 02](../02-paged-attention-kvcache/design.md)）存的是 decoder 每层每个 token 的 K/V。encoder cache 是「图像 embedding 的临时存放点」，KV cache 是「attention 的长期记忆」。
+- **镜像缓存 P0/P1 vs encoder cache**：镜像缓存（`MirroredProcessingCache`）解决的是**跨进程 IPC 带宽**——同一张图第二次来时只过界 hash 不过界像素；encoder cache 解决的是**同一请求内 encoder 重复计算**。一个省「进程间搬数据」，一个省「GPU 上重算」，作用在不同环节。
+- **M-RoPE vs 普通 RoPE**：普通 RoPE（[模块 15](../15-mamba-rope/design.md) 一类）给每个位置一个 1D 标量位置；**M-RoPE**（Qwen2-VL）给每个位置一个 3D 位置 id（时间/高/宽），让视觉 token 能编码图像的 2D 空间结构、视频的时间结构。纯文本输入时 3 个轴取相同值，M-RoPE 退化成普通 1D RoPE——所以它是普通 RoPE 的「超集」，不是替代。
+
+> 🔗 **回扣[贯穿示例](../PRIMER.md#第三部分一个贯穿全文的玩具示例强烈建议先看懂这个)**：示例里那条请求 `token_ids = [11,7,4]` 是**纯文本**，三个都是真实文本 token；如果 prompt 里含一张图，前端会把一段**占位 token**插进序列（比如变成 `[11, <img>,<img>,...,<img>, 7, 4]`），这些占位位置对应的 K/V 不是直接由 embedding 算的，而是先让 vision encoder 把图算成一串 embedding、再 scatter 填进去，之后才和 `11/7/4` 一起进 decoder、写 KV。
+
+---
+
+### 1.4 这个模块要解决的问题
 
 一个支持多模态的 LLM（LLaVA、Qwen-VL、Qwen2-VL……）本质是「**vision/audio encoder + 文本 decoder**」的拼接：图像先过一个 ViT 类编码器变成一串「视觉 token 的 embedding」，再和文本 token 的 embedding 拼在一起喂进 decoder。要把这套东西塞进一个为**纯文本**设计、且追求**高吞吐 continuous batching** 的推理引擎，会撞上几组具体矛盾：
 

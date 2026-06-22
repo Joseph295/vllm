@@ -5,7 +5,44 @@
 
 ---
 
-## 1. 这个模块解决什么问题
+## 1. 背景与定位
+
+> 如果你还不清楚 **KV cache、prefill/decode、PagedAttention** 这些前置概念，请先读 [PRIMER 第一部分](../PRIMER.md#第一部分llm-推理服务-101先建立心智模型)（尤其 §1.3 讲 KV cache 为何是显存瓶颈）与 [模块 02](../02-paged-attention-kvcache/design.md)（分页 KV），这里默认你已经有了那套心智模型。
+
+### 1.1 位置
+
+MLA 是**某类模型（DeepSeek V2/V3/R1）特有的 attention 实现**，不是引擎骨架——它属于 [PRIMER §2.1](../PRIMER.md#21-两条-track先分清骨架和血肉) 说的"模型架构技术"那条 track（垂直、随模型而异）。在一个请求的旅程里，MLA 只替换 [PRIMER §2.2](../PRIMER.md#22-一个请求穿过哪些东西30-秒速览) 那张图里 GPU forward 阶段的 **attention 那一层**：
+
+- **上游**：调度器（[模块 01](../01-scheduler-batching/design.md)）照常决定这步算哪些请求的哪些 token；KV cache 的 block 分配照常由 [模块 02](../02-paged-attention-kvcache/design.md) 的 `KVCacheManager` 管。
+- **本模块**：当模型是 DeepSeek 系时，attention backend 被换成 MLA 版——**写进 KV cache 的不再是完整多头 K/V，而是一条压缩的 latent 向量**；读 KV 做 attention 时也走 MLA 特有的两条路径。
+- **下游**：attention 输出照常喂给后续层、最终采样出 token（[模块 06](../06-sampling-structured-output/design.md)）。
+
+一句话：**MLA 是 PagedAttention 的一个"省 KV"变体——分页、block table、slot 全沿用模块 02，只换了"每个 slot 里存什么"以及"怎么用它算 attention"。**
+
+> 🔗 回扣[贯穿示例](../PRIMER.md#第三部分一个贯穿全文的玩具示例强烈建议先看懂这个)：示例阶段③把每个 token 的完整 `k/v` 存进 `block_table=[7,3]` 指向的物理块。**若这条请求换成 MLA**，每个 token 存进 cache 的就不是完整的 `k0,v0`（多头、两份），而是**一条压缩的 latent 向量**（DSV3 里 576 维、单份、所有 head 共享）；block_table / slot_mapping 的分页寻址机制原封不动，只是每个 slot 里装的东西从"完整 KV"变成"latent"，于是 KV cache 大幅变小。
+
+### 1.2 关键文件与类各干什么（先认人）
+
+| 文件 / 类 | 主要作用（一句话） |
+|---|---|
+| `mla/common.py` 的 `MLACommonImpl` | MLA attention 实现主体：`forward` 把一步分流成 decode / prefill 两条路径，持有"吸收矩阵" `W_UK_T`/`W_UV` |
+| `mla/common.py` 的 `MLACommonBackend` | MLA backend 契约：声明 KV cache 形状退化为**单 head latent**（`head_size=576`）、禁用 cascade |
+| `mla/common.py` 的 `MLACommonMetadataBuilder` | 每步构建元数据，含 `reorder_batch`（把 decode/prefill 在 batch 内分两段）、chunked prefill workspace 分配 |
+| `mla/flashmla.py` / `mla/triton_mla.py` 的 `*Impl` | 两种 **decode** kernel 后端，只有 `_forward_decode` 不同（FlashMLA / Triton） |
+| `models/deepseek_v2.py` 的 `DeepseekV2MLAAttention` | 模型侧 MLA 层：把 hidden 投影压成 latent + decoupled rope key，再调 backend |
+| `concat_and_cache_mla`（`_custom_ops.py` + `cache_kernels.cu`） | 把 latent + rope 写进 paged KV cache 的单个 op |
+| `KVCacheManager`（属 [模块 02](../02-paged-attention-kvcache/design.md)） | block 分配 / slot 寻址照常由它管，MLA 只换 slot 内容，不碰这套账本 |
+
+### 1.3 和相似模块 / 概念的区别与联系（专治"听过但分不清"）
+
+- **MLA vs GQA vs MQA（省 KV 的三代手法）**：三者目标相同——压小 KV cache 这个显存头号消耗者（[PRIMER §1.3](../PRIMER.md#13-kv-cache它为什么存在为什么是瓶颈)）。**MQA**=所有 query 头共享 1 组 KV 头（最省但掉点）；**GQA**=分组共享（折中，主流）；**MLA**=把 KV 压成一条低秩 latent 向量、需要时再还原（DeepSeek，省得最狠且质量损失小）。GQA/MQA 见 [模块 14](../14-attention-variants/design.md)，对照见 [PRIMER §2.4](../PRIMER.md#24-易混概念对照区别与联系专治听过但分不清)。代价是 MLA 实现远比 GQA 复杂（要吸收矩阵、两套路径、decoupled RoPE）。
+- **latent KV vs 普通 KV**：普通 KV cache 每 token 存"完整多头 K + 完整多头 V"两份；MLA 每 token 只存"一条所有 head 共享的 latent + 一小段 rope key"一份。前者直接拿来做 attention，后者要先经上投影矩阵 `W_UK/W_UV` 还原（或吸收）才能算。**latent 是"压缩态的 KV"**，普通 KV 是"展开态"。
+- **吸收矩阵 vs 物化**：同一对上投影权重 `W_UK/W_UV`，decode 把它们**吸收**进 Q/O（不还原完整 KV、直接在 latent 维算），prefill 把它们**物化**（先还原完整多头 K/V 再走标准 MHA）。这对镜像是 MLA 最核心的结构（见 §3.3/§3.4）。
+- **prefill 物化路径 vs decode 吸收路径**：两条路径用**同一份 latent cache**，但算法不同——prefill 是 compute-bound、物化划算且能白嫖现成 FlashAttention kernel；decode 是 memory-bound、吸收省 KV 读带宽。这也是 MLA 必须用 `reorder_batch` 把同一步里的 prefill/decode 请求在 batch 内分两段的原因（见 §3.4）。
+
+---
+
+### 1.4 这个模块要解决的问题
 
 标准 Multi-Head Attention (MHA) 的 KV cache 是性能与显存的命门（见 [模块 02](../02-paged-attention-kvcache/design.md) §1）。它的显存占用正比于：
 

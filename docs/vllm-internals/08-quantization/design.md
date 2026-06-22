@@ -5,7 +5,44 @@
 
 ---
 
-## 1. 这个模块解决什么问题
+## 1. 背景与定位
+
+> 如果你还不清楚 **weights/KV cache 为何是显存大头、decode 为何 memory-bound** 这些前置概念，建议先读 [PRIMER 第一部分](../PRIMER.md#第一部分llm-推理服务-101先建立心智模型)（尤其 1.3 KV cache、1.4 memory-bound）。一句话先垫底：**量化 = 用更少的比特存权重 / 激活 / KV，省显存、省访存，换一点点精度。**
+
+### 1.1 这个模块在系统里的位置
+
+量化是一个**横切关注点**：它不改调度、不改 KV 分页、不改采样，只改"某一层的 weights 怎么存、forward 那一步怎么算"。
+
+- **上游**：启动期解析 checkpoint 里的 `quantization_config`，决定每层用哪种量化方法（[模块 00](../00-request-lifecycle/design.md) 模型加载阶段）。
+- **本模块**：在每个 Linear / FusedMoE / Attention 层的"创建权重 → 加载后重排 → forward"三步里介入，把全精度计算换成低精度计算。
+- **下游**：量化层产出的结果对模型其余部分**透明**——上层看到的还是同样 shape 的 FP16 输出，只是中间用低比特算/存。它和编译（[模块 07](../07-cuda-graph-compile/design.md)）、KV 分页（[模块 02](../02-paged-attention-kvcache/design.md)）正交叠加。
+
+一句话：**它是"插"在每层权重创建与 forward 之间的一套可替换策略，模型代码写一遍 fp16 即可同时支持所有量化方法。**
+
+### 1.2 关键文件与类各干什么（先认人）
+
+| 文件 / 类 | 主要作用（一句话） |
+|---|---|
+| `quantization/base_config.py` 的 `QuantizationConfig` (ABC) | 一种量化"方法"的配置 + 工厂；`get_quant_method(layer, prefix)` 是核心分派入口 |
+| `quantization/base_config.py` 的 `QuantizeMethodBase` (ABC) | 单层量化策略三段式：`create_weights` / `process_weights_after_loading` / `apply` |
+| `quantization/__init__.py` 的 `QUANTIZATION_METHODS` | 全局方法名注册表（25+ 种），名→类，运行时升级 kernel 靠遍历它 |
+| `layers/linear.py` 的 `LinearBase.__init__` | **无侵入替换发生处**：构造每个 Linear 时调 `get_quant_method` 拿到 method |
+| `quantization/gptq_marlin.py` / `awq_marlin.py` | weight-only（W4A16）的 GPTQ/AWQ + Marlin kernel 实现 |
+| `quantization/fp8.py` | W8A8/FP8 的 Linear / MoE / KV cache 三类方法 |
+| `quantization/kv_cache.py` 的 `BaseKVCacheMethod` | KV cache 量化：给 Attention 层加 `k_scale`/`v_scale`/`q_scale` |
+| `utils/marlin_utils.py` | 把权重/scale/zero_point 重排成 Tensor-Core MMA 布局（性能关键的一次性重排） |
+
+### 1.3 和相似模块 / 概念的区别与联系（专治"听过但分不清"）
+
+- **weight-only（W4A16）vs W8A8 vs KV cache 量化**：三类正交，解决不同瓶颈。**weight-only**（GPTQ/AWQ）只压**权重**到 4/8-bit、激活保持 FP16，GEMM 时把权重反量化回 FP16 再算——**省访存、加速 memory-bound 的 decode，但算力不省**。**W8A8/FP8** 把**权重和激活都**压到 8-bit，直接走低精度 Tensor Core——**省算力、加速 compute-bound 的 prefill 与大 batch**。**KV cache 量化** 只压**写进 KV cache 的 k/v**、不动权重/GEMM——**扩容上下文与并发**。一个模型可以同时 weight-only + FP8 KV。
+- **GPTQ vs AWQ vs FP8**：前两者是 weight-only 的两种**标定算法**——GPTQ 用二阶 Hessian 信息逐列量化、可带 act-order（`desc_act`）重排列；AWQ 按激活幅度保护"显著权重通道"、必带 zero_point、不需要 reorder。FP8 是**数值格式**（E4M3，4 位指数 3 位尾数），既可只量权重也可 W8A8 量激活。一句话：**GPTQ/AWQ 回答"INT4 怎么量得准"，FP8 回答"用哪种 8-bit 浮点"。**
+- **scale 与 zero_point**：量化的核心两个旁路参数。**scale** 是缩放系数——把低比特整数还原回浮点的倍率（`w_fp16 = q_int * scale`）；**zero_point** 是零点偏移——非对称量化时整数 0 对应的浮点值（`w_fp16 = (q_int - zero_point) * scale`）。对称量化只需 scale（GPTQ），非对称量化两者都要（AWQ）。group-wise 量化是每 128 个权重共享一组 (scale, zp)，精度远好于整行一个 scale。
+- **Marlin 为何要权重重排**：Marlin/Machete 这类高性能 kernel 把量化权重**直接喂进 NVIDIA Tensor Core 的 MMA 指令**，MMA 要求操作数按一种特定的、非行主序的 lane 排布。若 forward 时再重排，每次 GEMM 都要 reshuffle、得不偿失。于是 vLLM 在加载后**一次性**把权重 shuffle 成 MMA 期望的交错布局（`process_weights_after_loading`），换 forward 时"量化权重零额外 reshuffle 直流 MMA"。
+- **本模块 vs 编译（[模块 07](../07-cuda-graph-compile/design.md)）**：量化产出的算子也必须**能被 torch.compile 追踪、能进 cudagraph**——量化 buffer 必须是固定地址的普通 `Parameter`、`apply` 路径必须可被 Dynamo 追踪。这条隐形约束催生过专门修复（见 §7.2）。
+
+---
+
+### 1.4 这个模块要解决的问题
 
 LLM 推理的瓶颈分两段，量化对两段都有用：
 

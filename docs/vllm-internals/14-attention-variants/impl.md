@@ -40,6 +40,8 @@ GQA/MQA —— 模型层 + cache 格式 + kernel
 
 ## 2. 调用链一：SWA 的 KV block 管理与释放
 
+> **这条链在干嘛**：SWA 的精髓不在 kernel（kernel 只是加个 `window_size` 参数屏蔽窗外），而在 KV 管理——既然位置 i 的 token 永远不会再被 i+W 之后的 query 看到，那它所在的 block 就可以提前释放、还给别的请求用。这条链追的就是"窗口外 block 怎么被摘掉、被 `null_block` 占位，以及 SWA 下 prefix cache 命中怎么重新定义"。
+
 追踪一条 SWA 请求的一个调度步里，"窗口外 block 如何被提前释放、命中如何重定义"。
 
 ### A. SWA 的 cache 格式声明 —— `SlidingWindowSpec`
@@ -136,6 +138,8 @@ else:
 ---
 
 ## 3. 调用链二：Cascade 的公共前缀检测与两段 attention
+
+> **这条链在干嘛**：当批内多条请求共享一段公共前缀（如同一 system prompt），不想让每条都把前缀 KV 重读一遍。这条链追的是：①调度器怎么靠 ref_cnt 检测出"所有 running 请求都共享的前缀块数"；②model runner 怎么把"块数"换成"安全的 token 长度"并判断划不划算；③backend 怎么用两个 kernel（前缀算一次 + 各自后缀）+ LSE 合并把结果还原成等价于一次算。
 
 追踪"公共前缀如何被检测、如何只算一次、如何与后缀合并"。
 
@@ -290,6 +294,8 @@ else:
 ---
 
 ## 4. 调用链三：GQA/MQA 的 KV 头映射
+
+> **这条链在干嘛**：GQA/MQA 在 vLLM 里几乎"免费"，因为它只改一个量——`num_kv_heads`。这条链追的是这个量怎么从 HF config 读出来、按 TP 切分/复制，一路把 cache 张量第 4 维缩小（显存收益的全部来源），最后让 kernel 内部把多个 query 头映射到同一个 KV 头去读（不物理复制 KV，否则就白省了）。
 
 追踪 `num_kv_heads` 如何从 config 一路压缩到 cache 张量与 kernel。
 

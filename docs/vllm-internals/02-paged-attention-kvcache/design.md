@@ -5,7 +5,44 @@
 
 ---
 
-## 1. 这个模块解决什么问题
+## 1. 背景与定位
+
+> 如果你还不清楚 **KV cache 为什么存在、为什么是显存瓶颈**，请先读 [PRIMER §1.3](../PRIMER.md#13-kv-cache它为什么存在为什么是瓶颈)，这里默认你已经有了那套心智模型。
+
+### 1.1 这个模块在系统里的位置
+
+本模块是 KV cache 的**显存账本与底层 kernel**——别的模块"决定要算什么"，本模块负责"这些 token 的 KV 放哪、怎么读、怎么省"：
+
+- **上游**：调度器（[模块 01](../01-scheduler-batching/design.md)）每要调度一个请求，都先问本模块"**放不放得下**"、"前缀有没有命中"，拿到 block 分配结果。
+- **本模块**：把 KV cache 显存切成定长 **block（页）**，用 **block table** 把逻辑块映射到物理块（消灭碎片）；管 block 的分配/引用计数/驱逐/抢占；用 hash 让不同请求**复用**相同前缀的 block（prefix caching）。
+- **下游**：把 `block_table` / `slot_mapping` 喂给 attention kernel（[模块 11](../11-gpu-kernels-memory/design.md)），kernel 据此跨非连续物理块读写 KV、完成 attention。
+
+一句话：**它是 vLLM 高吞吐的物理基础——在有限显存里尽量多塞并发请求、并让相同前缀只算一次。**
+
+### 1.2 关键文件与类各干什么（先认人）
+
+| 文件 / 类 | 主要作用（一句话） |
+|---|---|
+| `v1/core/kv_cache_manager.py` 的 `KVCacheManager` | 对调度器的**门面**：`allocate_slots`（分配）/ `get_computed_blocks`（查前缀命中）/ `free`（释放） |
+| `v1/core/block_pool.py` 的 `BlockPool` | 物理块**总池**：持有所有 block、空闲链表、命中字典、负责缓存满块与驱逐 |
+| `v1/core/kv_cache_utils.py` 的 `KVCacheBlock` / `FreeKVCacheBlockQueue` / `BlockHashType` | 一个物理块的元数据、空闲块双向链表、prefix cache 的 hash 键 |
+| `v1/core/specialized_manager.py` 的 `FullAttentionManager` 等 | 按 attention 类型分派的**命中查找 & 驱逐**逻辑（full / sliding window） |
+| `v1/worker/block_table.py` 的 `BlockTable` | GPU 上的 block table 张量 `[max_num_reqs, max_num_blocks_per_req]`，喂给 kernel |
+| `v1/attention/backends/flash_attn.py` | 构建 `FlashAttentionMetadata`（含 `block_table`/`slot_mapping`），调 attention kernel |
+| `csrc/attention/`、`csrc/cache_kernels.cu` | CUDA kernel（V0/V1 共用）：`reshape_and_cache`（写 KV）、paged attention（读 KV） |
+
+### 1.3 和相似模块 / 概念的区别与联系（专治"听过但分不清"）
+
+- **PagedAttention vs 朴素 attention**：唯一本质区别是**多一次 `block_table[逻辑块] → 物理块` 的间接寻址**（见 §3.1）。朴素 attention 假设一条序列的 KV 连续存放；PagedAttention 让 KV 切成定长块、物理上可乱放、可共享，代价是 kernel 每次读 KV 多查一次表。
+- **prefix caching vs chunked prefill**：二者都让 prefill 变便宜，但**一个蹭现成、一个切自己**。prefix caching（本模块）=「复用别人/自己已算过的相同前缀 KV」；chunked prefill（[模块 01](../01-scheduler-batching/design.md)）=「把自己的长 prompt 拆成几步算」。详见 [PRIMER §2.4](../PRIMER.md#24-易混概念对照区别与联系专治听过但分不清)。
+- **抢占（preempt）vs 交换（swap）**：显存不足时 V1 只做"**重计算式抢占**"——`free` 掉低优先级请求的 block、打回 `waiting` 从头重算（§3.5）；V0 还支持 **swap-to-CPU**（把 KV 换到内存再换回），V1 配合默认 prefix caching 后重算更划算，故砍掉 swap。
+- **逻辑块 vs 物理块**：**逻辑块**是"这条序列的第 i 段 token"（按序列连续编号）；**物理块**是显存里真实的那块 page（`block_id`，可乱序、可被多条序列共享）。`block_table` 就是这两者之间的页表。
+
+🔗 **回扣[贯穿示例](../PRIMER.md#第三部分一个贯穿全文的玩具示例强烈建议先看懂这个)**：例子里 `[11,7,4]` 共 3 个 token、`block_size=2`，需要 2 个逻辑块，分到物理块 `block_table=[7,3]`；每个 token 的全局位置 `slot_mapping=[14,15,6]`（slot = 物理块号×2 + 块内偏移）。本模块要解决的就是"怎么把这 2 个逻辑块映射到物理块 7、3，且若别的请求前缀也是 `[11,7]` 就让它直接共享物理块 7"。
+
+---
+
+### 1.4 这个模块要解决的问题
 
 LLM 自回归推理时，每生成一个 token 都要读取它之前所有 token 的 Key/Value 向量（attention）。把这些 K/V 缓存下来（KV cache）避免重算，是推理性能的命门。但 KV cache 的**显存管理**有一组很难调和的矛盾：
 

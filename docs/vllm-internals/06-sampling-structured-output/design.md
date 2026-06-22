@@ -8,7 +8,46 @@
 
 ---
 
-## 1. 这个模块解决什么问题
+## 1. 背景与定位
+
+> 如果你还不清楚 **一次 forward 只产出"下一个 token 的概率分布"、再采样得到 1 个 token** 这个最基本的自回归循环，请先读 [PRIMER §1.1](../PRIMER.md#11-一次推理--循环吐-token)，这里默认你已经有了那套心智模型。
+
+### 1.1 这个模块在系统里的位置
+
+本模块是「模型 forward 算出 logits 之后、一个 token 真正诞生之前」那一小段的放大镜 —— 它正是 [模块 00](../00-request-lifecycle/design.md) §F"② 执行 —— GPU forward + 采样"里"采样"那一步。
+
+- **上游**：`GPUModelRunner` 跑完模型 forward + `compute_logits`，得到 `[num_tokens, vocab_size]` 的 logits（[模块 11](../11-gpu-kernels-memory/design.md) 的 GPU kernel 算出来的）。
+- **本模块**：两条线。**采样线**把 logits 经一串 GPU 算子（penalty / 温度 / top-k/top-p/min-p）变成 token id；**结构化输出线**在采样之前往 logits 叠一层 bitmask（把非法 token 置 `-inf`）、采样之后推进文法状态机。
+- **下游**：采样出的 token id 回到调度器 `update_from_output`（[模块 01](../01-scheduler-batching/design.md)）做 append / stop 检测；若开了投机解码，这里的拒绝采样器还服务 target 验证（[模块 05](../05-speculative-decoding/design.md)）。
+
+一句话：**它是"把模型打分变成真正 token"的最后一公里，全程在 GPU 上批量并行完成。**
+
+### 1.2 关键文件与类各干什么（先认人）
+
+| 文件 / 类 | 主要作用（一句话） |
+|---|---|
+| `v1/sample/sampler.py` 的 `Sampler` | 采样主体：`forward` 把 logits 经"penalty→温度→top-k/p→采样"算子链变成 token |
+| `v1/sample/metadata.py` 的 `SamplingMetadata` | 采样的"batch 级输入包"：所有参数已转成 `[num_reqs]` 张量 + per-request generator |
+| `v1/sample/ops/topk_topp_sampler.py` 的 `TopKTopPSampler` | top-k/top-p 截断 + 随机采样（Gumbel-max 无同步 / FlashInfer 两条路径） |
+| `v1/sample/ops/penalties.py` / `bad_words.py` | presence/frequency/repetition/min_token 惩罚；bad_words 前缀匹配置 -inf |
+| `v1/structured_output/__init__.py` 的 `StructuredOutputManager` | 结构化输出引擎级管理器：选后端、异步编译文法、每步生成 bitmask |
+| `v1/structured_output/backend_xgrammar.py` / `backend_guidance.py` | 两个文法后端：把 JSON Schema/正则/EBNF 编译成可逐步求值的 FSM |
+| `v1/structured_output/request.py` 的 `StructuredOutputRequest` | 挂在 `Request` 上的结构化状态：持 `Future[Grammar]` 或编译好的 grammar |
+| `sampling_params.py` 的 `SamplingParams` / `GuidedDecodingParams` | 用户原始采样配置 / 结构化输出配置 |
+| `v1/worker/gpu_model_runner.py` 的 `apply_grammar_bitmask` | 在 GPU runner 上把 bitmask in-place 叠到 logits（采样前） |
+
+### 1.3 和相似模块 / 概念的区别与联系（专治"听过但分不清"）
+
+- **greedy vs random 采样**：**greedy（贪心）** 直接取分数最大的 token（`argmax`，`temperature=0` 时），确定可复现；**random（随机）** 按概率分布抽一个，有创意但需 seed 才可复现。vLLM 把 `temperature < 1e-5` 定义为贪心，同一 batch 里贪心和随机请求可混跑，用 `torch.where` 按每行 temperature 二选一。
+- **temperature / top-k / top-p 各管什么（最容易混）**：**temperature** 是"分布尖锐度旋钮" —— 除以它，越小越尖（趋向贪心）、越大越平（更随机）；**top-k** 是"只在分数最高的 k 个 token 里采"（按个数截断）；**top-p（核采样）** 是"只在累积概率达 p 的最小 token 集合里采"（按概率质量截断）；**min-p** 是自适应阈值（砍掉概率低于"峰值某比例"的 token）。它们是几个**正交**的旋钮，可叠加使用。
+- **structured output 的 bitmask vs 重试**：要强制输出合法 JSON/正则，有两种思路 —— **重试**是先自由采样、事后校验、不合法就重采（不保证收敛、尾延迟不可控）；**bitmask（vLLM 选的硬约束）** 是在采样**之前**就把"当前文法状态下非法的 token"的 logits 置 `-inf`，让模型**只可能**采样到合法 token，保证 100% 合法且单步完成（详见 §3.4）。
+- **logits vs logprobs**：**logits** 是模型 forward 直接输出的"每个 token 的原始打分"（未归一化）；**logprobs** 是经 log_softmax 归一化后的"对数概率"，是返回给用户看的。关键设计：vLLM 用**惩罚/温度缩放之前**的原始 logits 算 logprobs，让用户拿到的概率反映模型真实分布，而不是被采样参数扭曲后的分布。
+
+> 一次 forward 只吐一个 token、KV cache 等更基础的概念见 [PRIMER 第一部分](../PRIMER.md#第一部分llm-推理服务-101先建立心智模型)。
+
+---
+
+### 1.4 这个模块要解决的问题
 
 模型 forward 的产物是一个 `[num_tokens, vocab_size]` 的 `logits` 张量——它只是"每个词的打分"，并不是 token。从打分到 token，要同时满足几组互相拉扯的诉求：
 
@@ -59,6 +98,8 @@ logits (float32)
 - **logprobs 用"原始 logits"算**（`sampler.py:28-36`）：在做任何 penalty / 温度缩放**之前**就先 `compute_logprobs(logits)` 存下 `raw_logprobs`。这是 V1 与 V0 的刻意区别——返回给用户的 logprobs 反映"模型真实的概率分布"，而不是被温度/惩罚扭曲后的分布。
 - **贪心与随机混批**：`all_greedy` / `all_random` 是 batch 级 fast-path（`sampler.py:96-103`）。若 batch 全贪心，直接 `argmax` 返回，不进随机分支；全随机则跳过 `argmax`；混合时两条分支都算，最后用 `torch.where` 按每行 temperature 选（`sampler.py:125-130`，`out=greedy_sampled` 复用张量）。
 - **温度即"贪心开关"**：`temperature < _SAMPLING_EPS`（1e-5）被定义为贪心（`sampling_params.py:510-515` 的 `sampling_type`）。GREEDY 请求在 InputBatch 里 temperature 被置 `-1.0` 以避免后续除零（`gpu_input_batch.py:270-272`）。
+
+> 🔗 **回扣[贯穿示例](../PRIMER.md#第三部分一个贯穿全文的玩具示例强烈建议先看懂这个)**：示例阶段④"token2 的输出过 `lm_head` 得 logits、`temperature=0` 取 argmax 得 id=9" —— **这一整步就是本模块干的事**。因为 `temperature=0`（< 1e-5）判为贪心，走的是 `greedy_sample` 的 `argmax(logits)` 快路径，直接返回分数最大的 token id=9，不进随机分支、不碰 top-k/top-p。若示例把 `temperature` 调成 >0，就会改走随机分支（§3.2 的 Gumbel-max），id 不再固定。
 
 ### 3.2 随机采样的两个 GPU 技巧：Gumbel-max 与 FlashInfer
 

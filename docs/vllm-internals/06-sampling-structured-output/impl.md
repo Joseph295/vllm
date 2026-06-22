@@ -44,6 +44,8 @@
 
 ### A0. 准备 —— 参数如何变成 batch 级张量
 
+> **这一步在干嘛**：每条请求各有自己的采样参数（温度、top_p…），但 GPU 要批量算。这一步把每条请求的标量参数写进对应 `_cpu` 数组的一行，并为带 seed 的请求建独立随机数发生器，最后打包成一个 batch 级的 `SamplingMetadata`（全是 `[num_reqs]` 张量）。没人用到的特性，对应张量直接置 None 以便后面整段跳过。
+
 **A0-1.** `vllm/sampling_params.py:510` `SamplingParams.sampling_type`
 温度与 seed 决定采样类型：
 ```python
@@ -101,6 +103,8 @@ return SamplingMetadata(temperature=temperature, all_greedy=..., generators=self
 
 ### A1. 入口 —— `Sampler.forward`
 
+> **这一步在干嘛**：采样的总入口。先在动任何手脚之前把 logprobs 存下来（保证返回给用户的是真实概率），再依次叠加各种 logits 修改算子，最后采样出 token。
+
 **A1-1.** `vllm/v1/sample/sampler.py:23` `Sampler.forward(logits, sampling_metadata)`
 ```python
 num_logprobs = sampling_metadata.max_num_logprobs
@@ -117,6 +121,8 @@ sampled = sampled.long()
 > 注释（`:28-33`）点明：logprobs 用**原始 logits** 算，与 V0 不同。这样返回给用户的 logprobs 是模型真实分布，不被温度/惩罚扭曲。
 
 ### A2. logits 预处理算子（按 batch 索引就地修改）
+
+> **这一步在干嘛**：在采样前对 logits 动几刀 —— 禁掉不允许的 token、禁掉会组成 bad word 的那一步、加上用户指定的 logit_bias、施加重复/出现频率等惩罚。全部 in-place 改同一个 logits 张量、全 batch 向量化。
 
 **A2-1.** `sampler.py:249` `apply_allowed_token_ids`
 ```python
@@ -160,6 +166,8 @@ if not sampling_metadata.no_penalties:
 
 ### A3. `sample` —— 贪心 / 随机分支
 
+> **这一步在干嘛**：真正出 token 的地方。全贪心 batch 直接 `argmax` 返回；否则除以温度、做 min-p 截断、走随机采样；贪心和随机混在一个 batch 时两条都算，再用 `torch.where` 按每行温度二选一。
+
 **A3-1.** `sampler.py:85` `Sampler.sample()`
 ```python
 assert not (all_greedy and all_random)
@@ -196,6 +204,8 @@ logits[~valid_token_mask] = -float('inf')
 ```
 
 ### A4. top-k / top-p + 随机采样 —— `TopKTopPSampler`
+
+> **这一步在干嘛**：随机分支的核心。先按 top-k/top-p 把长尾 token 砍掉（置 -inf），再从剩下的分布里随机采一个。采样刻意不用会触发 CPU-GPU 同步的 `multinomial`，改用"指数分布除法 + argmax"（Gumbel-max）全程在 GPU 上无同步完成。
 
 **A4-1.** `ops/topk_topp_sampler.py:29` `TopKTopPSampler.__init__` —— **实现选择**
 构造时根据平台/库可用性把 `self.forward` 绑到不同实现：
@@ -252,6 +262,8 @@ return flashinfer_sample(probs, k, p, generators)
 
 ### A5. 收尾 —— logprobs 与打包
 
+> **这一步在干嘛**：把采出的 token id 打包成 `SamplerOutput`；若用户要 logprobs，就从 A1 存下的原始 logprobs 里取出 topk + 采样 token 自己的概率和排名。
+
 **A5-1.** `sampler.py:54-71`
 ```python
 sampled = sampled.long()
@@ -264,6 +276,8 @@ return SamplerOutput(sampled_token_ids=sampled.unsqueeze(-1), logprobs_tensors=l
 - `sampled` 转 int32 减小张量（`:62`）；FlashInfer 返回 int32 而 torch 返回 int64，故前面统一 `.long()`（`:50-54` 注释）。
 
 ### A6. runner 串接 + spec decode 衔接
+
+> **这一步在干嘛**：在 GPU runner 里把整条采样链接起来 —— 先 `compute_logits`，若有结构化约束就叠 bitmask（链 b），再 `sample`；若开了投机解码则改由拒绝采样器接管。还要处理 chunked prefill 中间步"采了但要丢弃"的 token，并倒回随机数游标保证可复现。
 
 **A6-1.** `gpu_model_runner.py:1075-1097` `execute_model`
 ```python
@@ -298,6 +312,8 @@ if seq_len < req_state.num_tokens:               # 这一步只是部分 prefill
 
 ### B1. 请求入口 —— 后端选择与校验
 
+> **这一步在干嘛**：结构化输出请求一进门，就先选好文法后端（xgrammar / guidance / auto）并把文法 parse 一遍校验（不编译），避免把非法文法送进异步编译后才发现。校验也是 `auto` 模式回退的依据 —— xgrammar 校验抛异常就改用 guidance。
+
 **B1-1.** `vllm/v1/engine/processor.py:79` `_validate_sampling_params` → `:144` `_validate_structured_output`
 ```python
 supported_backends = ["xgrammar", "xgrammar:disable-any-whitespace",
@@ -326,6 +342,8 @@ self.status = (RequestStatus.WAITING_FOR_FSM
 > 结构化请求一进来就是 `WAITING_FOR_FSM`（`RequestStatus` 枚举 `:152`），等编译完成。
 
 ### B2. 异步编译 —— `grammar_init`
+
+> **这一步在干嘛**：把 JSON Schema/正则编译成可逐步求值的 FSM（grammar matcher）是 CPU 重活，会拖住 GPU。这里把编译丢进线程池、返回一个 Future，请求先停在 `WAITING_FOR_FSM` 状态，等编译完才放行 —— 让 GPU 永远去算"文法已就绪"的请求。
 
 **B2-1.** `vllm/v1/engine/core.py:180-182` `EngineCore.add_request`
 ```python
@@ -361,6 +379,8 @@ return XgrammarGrammar(matcher=xgr.GrammarMatcher(ctx), vocab_size=self.vocab_si
 
 ### B3. 调度时检查编译完成 + 分配 bitmask index
 
+> **这一步在干嘛**：调度器每步非阻塞地探一下文法 Future 好了没 —— 没好就把请求放回等待队列、本步跳过；好了就转 `WAITING` 进入正常调度，并给每个结构化请求分配一个 batch index（后面填/切 bitmask 要用）。
+
 **B3-1.** `vllm/v1/core/sched/scheduler.py:284-291` —— `WAITING_FOR_FSM` 门控
 ```python
 if request.status == RequestStatus.WAITING_FOR_FSM:
@@ -384,6 +404,8 @@ if request.status == RequestStatus.WAITING_FOR_FSM:
 > `structured_output_request_ids` 把 `req_id → 调度顺序 index` 记下，注释（`:139-144`）说明用途：切 bitmask、只对结构化请求 apply mask。
 
 ### B4. 生成 bitmask
+
+> **这一步在干嘛**：在 scheduler 进程（CPU）上，为每个结构化请求问一下文法"当前状态下哪些 token 合法"，把答案填进一个位图（bitmask，每 32 个 token 压进一个 int32），转成 `np.ndarray` 随 `SchedulerOutput` 过界发给 worker。bitmask 张量只分配一次复用。
 
 **B4-1.** `scheduler.py:399-403` —— schedule() 末尾调用
 ```python
@@ -413,6 +435,8 @@ return bitmask_tensor.numpy()                                       # np.ndarray
 - **已 terminated 的 grammar 跳过填充**（`:101`）——它不再约束（终止后该位置保持上一次/全零，后续逻辑不再 apply）。
 
 ### B5. 应用 bitmask 到 logits（GPU runner）
+
+> **这一步在干嘛**：在 GPU 上、采样之前，把 bitmask 叠到 logits —— 非法 token 的 logits 置 `-inf`，模型就只可能采到合法 token。因为 scheduler 填 bitmask 的顺序和 GPU runner 的 batch 排列可能不同，这里要先逐行重排对齐，否则会把约束套错请求。
 
 **B5-1.** `gpu_model_runner.py:1077-1079` execute_model 中
 ```python
@@ -448,6 +472,8 @@ xgr.apply_token_bitmask_inplace(                       # ← 非法 token logits
 > 关键边界（注释 `:950-954`）：scheduler 按调度顺序填 bitmask，但 `InputBatch` 因持久化/swap 排列可能不同，故须**逐行重排**对齐，否则会把 A 请求的合法集合错套到 B 请求上。`apply_token_bitmask_inplace` 是 xgrammar 的 CUDA kernel，对 `indices` 指定的行把 bitmask 为 0 的 token 置 -inf。`# TODO: compatibility with spec decode`（`:979`）——目前 bitmask 与投机解码不兼容。
 
 ### B6. 采样后推进 FSM
+
+> **这一步在干嘛**：token 采出来后，把它喂回文法状态机推进一格 —— 下一步 `fill_bitmask` 才能基于新状态给出新的合法 token 集合。因为采样前已被 bitmask 约束过，这里推进理论上必然成功；失败说明有 bug。文法到达终止态后就不再约束。
 
 **B6-1.** `vllm/v1/core/sched/scheduler.py:655-660` `update_from_output` 中
 ```python

@@ -6,7 +6,45 @@
 
 ---
 
-## 1. 这个模块解决什么问题
+## 1. 背景与定位
+
+> 这是全套文档里**最贴近 GPU 硬件**的一章。读之前建议先有这套心智模型：**prefill 吃算力、decode 吃显存带宽**（[PRIMER §1.2/§1.4](../PRIMER.md#第一部分llm-推理服务-101先建立心智模型)）、**KV cache 是分页存的**（[模块 02](../02-paged-attention-kvcache/design.md)）。本章讲的就是这些「软件决策」落到 GPU 线程/显存层面**到底怎么执行**。如果你不写 CUDA，也可以只读每节开头的大白话和 §3.1 的三级分工图。
+
+### 1.1 这个模块在系统里的位置
+
+这是整套引擎的**最底层**——所有上层模块（调度、KV 管理、并行、编译、量化）最终都要落到这里的 GPU kernel 和显存操作上：
+
+- **上游**：[模块 01](../01-scheduler-batching/design.md) 决定「算什么」、[模块 02](../02-paged-attention-kvcache/design.md) 决定「KV 放哪个 block」、[模块 03](../03-distributed-parallel/design.md) 决定「怎么跨卡切」——这些都是 **Python 编排**，产出的是「给哪些张量、按什么 block table、调哪个 kernel」的指令。
+- **本模块**：这些指令之下，GPU 上真正发生的事——`csrc/**` 里的 CUDA kernel 怎么用 thread/warp 算 attention、KV 怎么按分页布局写进显存、显存怎么 profiling 出来切块、CUDA graph 怎么省 launch 开销、custom all-reduce 怎么用 IPC 直读对端显存、量化 GEMM 怎么 dequant-fuse。
+- **下游**：没有下游了——这里就是「软件遇到硅」的地方。kernel 算完、KV 写完、显存分配好，一步 forward 才算真正完成。
+
+一句话：**上层把「算什么、放哪里」决定好，本模块解决「在 GPU 的线程/warp/显存层面，到底怎么把它算出来、放下去，且要快」。**
+
+### 1.2 关键文件与类各干什么（先认人）
+
+| 文件 / 符号 | 主要作用（一句话） |
+|---|---|
+| `csrc/attention/attention_kernels.cuh` 的 `paged_attention_kernel` | 核心 device 函数：paged decode attention，被 v1/v2 两个入口包装 |
+| `csrc/attention/paged_attention_v1.cu` / `_v2.cu` | 两个 launcher：V1 单 kernel 扫整条序列；V2 沿 KV 维切 partition 并行 + reduce kernel 合并 |
+| `csrc/cache_kernels.cu` 的 `reshape_and_cache(_flash)` | 按 `slot_mapping` 把新算的 K/V 写进分页 KV cache（含 fp8 量化写入） |
+| `csrc/custom_all_reduce.cu` / `.cuh` 的 `CustomAllreduce` | TP 下的小消息 all-reduce：CUDA IPC 直读对端显存、自旋 flag 同步 |
+| `csrc/quantization/marlin` / `permute_cols.cu` | 量化 GEMM：离线重排权重列 + 把 dequant 融进 GEMM 取数 |
+| `vllm/v1/worker/gpu_worker.py` 的 `determine_available_memory` | 跑一次 dummy forward 量显存峰值，算出 KV cache 能开多大 |
+| `vllm/v1/worker/gpu_model_runner.py` 的 `initialize_kv_cache` / `capture_model` | 把剩余显存切成等大 block 分配 KV 张量；捕获 CUDA graph |
+| `vllm/attention/ops/paged_attn.py` | Python 侧 V1/V2 启发式选择 + 转发到 `torch.ops` 绑定 |
+
+### 1.3 和相似模块 / 概念的区别与联系（专治"听过但分不清"）
+
+- **PagedAttention kernel V1 vs V2**：同一个 `paged_attention_kernel`，靠模板参数区分两种用法。**V1** 一个 thread block 串行扫完整条序列的所有 KV——短序列、或 batch 大（并行度已够）时用它，省一个 reduce kernel。**V2** 把一条序列的 KV 沿序列维切成 512-token 的 partition、每个 partition 一个 block 并行算，再用一个 reduce kernel 把各 partition 的局部 softmax 合并——长序列 + 小 batch 时用它把闲着的 SM 填满。本质是 FlashDecoding 的 split-KV 思想（详见 §3.2）。
+- **kernel vs Python 编排**：上层模块（01~10）讲的是 **Python 怎么决策**（调度、分配、选 backend），都跑在 CPU 上、可单测、不碰 GPU；本模块讲的是 **CUDA kernel 怎么执行**（thread/warp 分工、显存读写）。一个「动脑决定」、一个「动手计算」——这条界线和 [模块 01](../01-scheduler-batching/design.md) 里「调度器 vs Executor」是同一条，只是更下沉了一层。
+- **显存 profiling vs 静态分配**：KV cache 要吃掉「权重 + 激活峰值」之外的全部显存，但激活峰值**静态算不准**（取决于 batch、序列长度、中间张量）。所以 vLLM 不静态推算，而是**真跑一次最大 batch 的 dummy forward**量出实际峰值，再把剩余显存切成等大 block（§3.5）。「跑一次量峰值」对「拍脑袋估算」，是这章一个反复出现的取舍。
+- **custom all-reduce vs NCCL**：两者都做 TP 的跨卡求和。**NCCL** 是通用库，对小消息（decode 时激活很小）有协商/调度开销、延迟偏高；**custom all-reduce** 用 CUDA IPC 让各卡直接读写对端显存（P2P）、自旋 flag 同步，路径极短，专治小消息低延迟——但有强约束（仅 NVLink 全连接 + ≤8 卡，详见 §3.8）。它是 NCCL 在特定拓扑下的「快车道」，不是替代品。
+
+> 🔗 **回扣[贯穿示例](../PRIMER.md#第三部分一个贯穿全文的玩具示例强烈建议先看懂这个)**：示例的 decode 第 1 步要算新 token（pos=3）对前面所有 KV 的 attention。**这一步正是在本模块的 `paged_attention_kernel` 里发生的**：kernel 内部用 `block_table[pos // block_size]` 把逻辑位置 pos 翻成物理块号，再 `× block_size + 偏移` 取到具体的 slot。示例里 `block_size=2`、`block_table=[7,3]`，于是 `pos=3 → block_table[3//2]=block_table[1]=物理块3 → 3*2+1=slot 7`——kernel 就是从 slot 7 取出刚写入的 `k3,v3` 参与 attention 的。`:257` 那行 `physical_block_number = block_table[block_idx]` 就是这个翻译动作的代码落点。
+
+---
+
+### 1.4 这个模块要解决的问题
 
 上层模块把请求调度好、把 block 分配好、把 block table 填好之后，剩下的全是 GPU 上的硬活：
 

@@ -6,7 +6,47 @@
 
 ---
 
-## 1. 这个模块解决什么问题
+## 1. 背景与定位
+
+> 如果你还不清楚 **prefill/decode 两阶段的计算特征差异、KV cache 为什么是瓶颈、continuous batching** 这些前置概念，请先读 [PRIMER 第一部分](../PRIMER.md#第一部分llm-推理服务-101先建立心智模型)，这里默认你已经有了那套心智模型。
+
+### 1.1 这个模块在系统里的位置
+
+PD 分离是叠加在**整条推理服务链路最外层**的一个**部署形态选择**：它不改单个实例内部怎么算，而是把一条请求的两个阶段拆到**两个独立的 vLLM 实例**上，再加一层 KV 跨实例搬运。
+
+- **上游**：一个**外置编排代理（proxy）** 收到 client 请求，先发给 prefill 实例（把 `max_tokens` 设成 1，让它只做 prefill），等它算完再把原请求发给 decode 实例。vLLM 实例本身不知道对方存在。
+- **本模块**：`vllm/distributed/kv_transfer/` 这套基础设施 —— prefill 实例（**KV producer**）在 model forward 末尾把算好的 KV cache + hidden states **发**出去，decode 实例（**KV consumer**）在 forward 开头**收**进来、跳过 prefill 前向、直接续算 decode。
+- **下游**：decode 实例拿到 KV 后，这条请求就在它本地正常自回归出 token（见 [模块 01](../01-scheduler-batching/design.md) 调度 / [模块 06](../06-sampling-structured-output/design.md) 采样），后续步的 KV 都在本地，不再走传输层。
+
+一句话：**它是一层"把 prefill 和 decode 拆到两台机器、中间搬运 KV"的部署级机制，本模块只负责"搬 KV"这件事。**
+
+> ⚠️ **架构现状（务必先读）**：本仓库快照里这套代码**只接在 V0 worker（`vllm/worker/model_runner.py`）上**，`vllm/v1/` 下没有任何引用；`vllm/engine/arg_utils.py:1526-1530` 把 `--kv-transfer-config` 列为"V1 尚不支持"，**一旦设置就会从 V1 回退（fallback）到 V0**。整套机制官方标注为 **experimental** 且**仅支持 1P1D（1 prefill + 1 decode）**。下文以 V0 集成路径为唯一事实来源。
+
+### 1.2 关键文件与类各干什么（先认人）
+
+| 文件 / 类 | 主要作用（一句话） |
+|---|---|
+| `config.py` 的 `KVTransferConfig` | PD 分离的全部配置：选哪种 connector、本实例是 producer 还是 consumer、`kv_rank`、`kv_ip:kv_port` 等 |
+| `kv_transfer_agent.py` 的 `KVTransferAgent` | 进程级单例总控，薄 shim：把 send/recv 原样转给底层 connector |
+| `kv_connector/base.py` 的 `KVConnectorBase` | **最上层抽象**：贴着 model runner 的 `send_kv_caches_and_hidden_states` / `recv_...` 两个钩子，负责"从 paged KV 抽本请求的 KV、决定能否 bypass 前向" |
+| `kv_connector/simple_connector.py` 的 `SimpleConnector` | connector 的参考实现：按请求/layer/slot 三维切分 KV，PyNccl 与 Mooncake 共用它 |
+| `kv_lookup_buffer/simple_buffer.py` 的 `SimpleBuffer` | **中间层抽象**：把 FIFO 管道封装成"按 token 查找"的 buffer，解决 prefill/decode 请求乱序、并做背压 |
+| `kv_pipe/pynccl_pipe.py` 的 `PyNcclPipe` | **最底层抽象**：FIFO 张量管道，`send_tensor`/`recv_tensor`，GPU 走 NCCL、CPU 走 stateless group |
+| `kv_connector/factory.py` 的 `KVConnectorFactory` | connector 工厂：按字符串懒加载并实例化具体 connector |
+| worker `model_runner.py`（属 V0） | PD 分离的**接入点**：forward 前判断 `need_recv_kv`、forward 后判断 `need_send_kv` |
+
+### 1.3 和相似模块 / 概念的区别与联系（专治"听过但分不清"）
+
+- **producer(prefill) 实例 vs consumer(decode) 实例**：同一份 worker 代码，靠配置 `kv_role` 决定身份 —— producer 只**发** KV（`kv_role=kv_producer`），consumer 只**收** KV（`kv_role=kv_consumer`）。两者是**两个完全独立的 vLLM 进程组**，互不知道对方，只通过共享的 KV 传输管道对接；"谁先 prefill 后 decode"的时序由外置 proxy 保证。
+- **Connector vs LookupBuffer vs Pipe（本模块的三层抽象，最容易混）**：**Pipe** 是最底层的裸 FIFO 张量管道（NCCL / RDMA）；**LookupBuffer** 在 Pipe 之上，把"先进先出"翻译成"按 token 内容查找"，解决两实例请求顺序不一致 + 背压；**Connector** 在最上层，贴着 model runner，负责从 paged KV 里抽出本请求的 KV、决定要不要 bypass 前向。三层各只对一个约束负责（详见 §3.2、§8.1#1）。
+- **PD 分离 vs 单实例混跑**：vLLM 默认是**单实例混跑**（continuous batching + chunked prefill 把 prefill 和 decode 塞进同一 batch，见 [模块 01](../01-scheduler-batching/design.md)）；**PD 分离**则把两阶段**物理拆到不同实例**，各自独立选并行度/batch/GPU 配比。前者省机器、实现简单，后者能分别优化 TTFT/TPOT 但实例数翻倍（详见 §1.4、§3.6 何时划算）。
+- **仅 V0**：如 §1.1 所述，这套机制当前**只在 V0 worker 上接通**；用 V1 引擎并设了 `--kv-transfer-config` 会强制回退到 V0，享受不到 V1 的进程模型/调度收益。
+
+> chunked prefill vs prefix caching、continuous batching vs 静态 batching 等更基础的概念对照见 [PRIMER §2.4](../PRIMER.md#24-易混概念对照区别与联系专治听过但分不清)。
+
+---
+
+### 1.4 这个模块要解决的问题
 
 LLM 自回归推理天然分成两个**计算特征截然相反**的阶段：
 
@@ -72,6 +112,8 @@ LLM 自回归推理天然分成两个**计算特征截然相反**的阶段：
 - Proxy 随后把**原请求**发给 decode 实例；decode 实例在 forward 开头**收**到 KV，`bypass_model_exec=True` 跳过 prefill 前向，直接拿 hidden states 算第一个 token 并继续 decode。
 
 > 关键认知：**vLLM 实例之间不互相知道对方**。它们只通过共享的 KV 传输管道（按 `kv_ip:kv_port` + `kv_rank` 建立的 stateless process group）对接。"哪条请求先 prefill 后 decode"的时序由 proxy 保证。
+>
+> 🔗 **回扣[贯穿示例](../PRIMER.md#第三部分一个贯穿全文的玩具示例强烈建议先看懂这个)**：示例那条请求 `[11,7,4]`，若改成 PD 分离跑 —— **prefill 实例**先做阶段②③（算出 3 个 token 的 KV，写进它自己的物理块 `[7,3]`），然后把这些 KV + 最后一个 token 的 hidden states 经 connector 发出；**decode 实例**收到后跳过 prefill 前向，直接用 hidden states 做阶段④采样出 id=9，并把收到的 KV `reshape_and_cache` 回**它自己**分配的物理块（块号通常和 `[7,3]` 不同，因为两实例 block 各自独立），之后的阶段⑤ decode 就全在 decode 实例本地进行。
 
 ### 3.2 三层可插拔抽象：Connector / LookupBuffer / Pipe
 

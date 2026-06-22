@@ -7,6 +7,57 @@
 
 ---
 
+## 1. 背景与定位
+
+> 如果你还不清楚 **KV cache 为何随序列线性增长、attention 为何置换不变** 这些前置概念，请先读 [PRIMER 第一部分](../PRIMER.md#第一部分llm-推理服务-101先建立心智模型)（尤其 §1.3 KV cache），这里默认你已经有了那套心智模型。本模块是 A（Mamba/SSM）/ B（位置编码）两部分并列，下面的 1.1~1.3 分别交代两者，1.4 收纳上面的范围说明。
+
+### 1.1 位置
+
+两部分都属于 [PRIMER §2.1](../PRIMER.md#21-两条-track先分清骨架和血肉) 里"模型架构技术"那条 track（随模型而异），但各动一处：
+
+- **A 部分（Mamba/SSM）**：替换 Transformer 的整个 attention 层——用一个**常量大小的递归状态**代替随序列线性增长的 KV cache。混合架构（Jamba 等）里 attention 层和 mamba 层在同一个模型里共存，各取各的缓存。**本快照里 mamba 仍是 V0-only**（见上方架构说明与 §A.3）。
+- **B 部分（位置编码）**：插在 attention 的 Q/K 投影**之后、算 attention 之前**，把位置信息旋转进 Q/K。它不碰 KV cache 结构，只改 Q/K 的值；V1/V0 共用同一套实现。
+
+一句话：**A 换的是"历史怎么存"（状态 vs KV），B 改的是"位置怎么进 attention"（旋转 Q/K）——两者都关乎序列建模，但作用在 forward 的不同位置。**
+
+> 🔗 回扣[贯穿示例](../PRIMER.md#第三部分一个贯穿全文的玩具示例强烈建议先看懂这个)：**B 部分能对上示例**——示例阶段②算 q/k/v 时，真实模型会先对 q、k 按各自位置做 RoPE 旋转（pos0/1/2 各转不同角度）再算 attention 分数；示例为手算简洁省略了这一步。**A 部分（Mamba）与示例的 attention 路径不同**：示例走的是标准 attention（每个 token 存 K/V 进 block_table），而 mamba 层不存 K/V、只维护一个固定大小的状态 `h`，没有 block_table 那套分页寻址，因此这里跳过回扣。
+
+### 1.2 关键文件与类各干什么（先认人）
+
+| 文件 / 类 | 主要作用（一句话） |
+|---|---|
+| **A** `mamba/mamba_mixer.py` / `mamba_mixer2.py` 的 `MambaMixer`/`MambaMixer2` | Mamba-1/2 的层实现：因果卷积 + selective scan，含 input-dependent 的 Δ/B/C 投影 |
+| **A** `mamba/mamba2_metadata.py` 的 `prepare_mamba2_metadata` | top-level 算一次的元数据（seq_idx/chunk_indices…），所有 mamba2 层共享 |
+| **A** `models/mamba_cache.py` 的 `MambaCacheManager` | 跨步持有 conv/ssm 状态张量，按请求分配"状态槽"（独立于 V1 的 KVCacheManager） |
+| **A** `models/constant_size_cache.py` 的 `ConstantSizeCache` | 状态缓存基类：定长槽的分配 / 释放 / 拷贝，无 block / 无前缀复用 |
+| **A** `models/jamba.py` / `mamba2.py` | 混合架构 / 纯 SSM 模型；按层类型分派 KV cache vs 状态缓存（均 `SupportsV0Only`） |
+| **B** `layers/rotary_embedding.py` 的 `RotaryEmbedding` 及子类 | 所有 RoPE 变体：持 `cos_sin_cache`，forward 原地旋转 Q/K；各外推法只重写 `_compute_inv_freq` |
+| **B** `layers/rotary_embedding.py` 的 `get_rope` | 工厂：按 `rope_scaling` 配置分派到正确子类 + `_ROPE_DICT` 全局缓存实例 |
+| **B** `layers/rotary_embedding.py` 的 `MRotaryEmbedding` | M-RoPE：三维 position（时/高/宽）+ 按 `mrope_section` 分段旋转 |
+| **B** `csrc/pos_encoding_kernels.cu` | RoPE 的 CUDA kernel：按 position 查 `cos_sin_cache`、每 block 一个 token 旋转 |
+
+### 1.3 和相似模块 / 概念的区别与联系（专治"听过但分不清"）
+
+**A 部分（Mamba/SSM）：**
+
+- **SSM 常量状态 vs KV cache 线性增长**：attention 必须保留每个历史 token 的 K/V 才能"回看"任意位置，缓存随序列 O(L) 增长（[PRIMER §1.3](../PRIMER.md#13-kv-cache它为什么存在为什么是瓶颈)）；SSM 把"回看历史"改成"维护一个固定大小的递归状态 `h`"，缓存恒为 O(1)、decode 一步也是 O(1)。代价是有损压缩（精确检索弱于 attention）。
+- **Mamba vs attention**：attention 是"精确但贵"（每个历史 token 可被精确寻址，但显存/算力随长度涨）；Mamba 是"便宜但有损"（状态恒定，但历史被压缩进 `h`）。二者不是替代而是互补。
+- **混合架构（hybrid）**：正因为上一条，工程上催生了 Jamba/Bamba/Zamba2 等——**大部分层用便宜的 mamba、少数层穿插 full attention** 兜住精确检索能力。一个模型里两套缓存（状态槽 + KV block）按层类型并存。
+
+**B 部分（位置编码）：**
+
+- **RoPE vs 绝对位置编码**：绝对位置编码（原始 Transformer 的 sinusoidal、可学习 embedding）给 token **加**一个位置向量，注入的是绝对位置，相对位置要模型自己学；RoPE 不加而是**旋转** Q/K，使点积 `q_m·k_n` 在数学上只依赖相对位移 `m−n`——相对位置无参数、无额外计算地自然涌现。
+- **M-RoPE vs RoPE**：普通 RoPE 的 position 是一维 token 下标；M-RoPE（Qwen2-VL）把 position 升到三维 `(t,h,w)`，给图像/视频 token 编码空间结构。文本 token 三维取同值时 M-RoPE 退化成普通 RoPE——是 RoPE 的真·超集。
+- **YaRN 外推 vs 直接外推**：模型在 `L_train` 上训练，推理想喂更长上下文。直接外推会让高频维产生没见过的相位、注意力崩溃；YaRN（及 NTK/Linear PI）**不微调**地重新分配旋转频率（高频外推、低频插值、中频平滑过渡），让长位置的相位落回训练见过的范围。
+
+---
+
+### 1.4 范围与架构（原开头）
+
+本模块讲两个看似无关、实则都关乎"序列建模如何省内存 / 如何编码位置"的主题：**A 部分** 用常量大小的递归状态替代 KV cache，以及 attention 层与 mamba 层如何共存；**B 部分** RoPE 如何把相对位置注入注意力、YaRN/NTK 如何不微调外推、M-RoPE 如何为图像/视频给出三维位置。架构归属与 V0/V1 现状见本文件开头的范围/架构说明 blockquote；下面 A.1 / B.1 起分别展开两部分各自要解决的具体问题。
+
+---
+
 # A 部分：Mamba/SSM 与混合架构
 
 ## A.1 这个模块解决什么问题
@@ -249,7 +300,7 @@ V1 里这套 position 在 `gpu_model_runner` 管理：prompt 部分预计算（`
 
 ---
 
-## N. 设计背后的考量与历史教训
+## C 部分：设计背后的考量与历史教训
 
 ### N.1 设计背后的考量（动机与历史）
 

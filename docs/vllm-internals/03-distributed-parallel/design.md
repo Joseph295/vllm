@@ -6,7 +6,45 @@
 
 ---
 
-## 1. 这个模块解决什么问题
+## 1. 背景与定位
+
+> 如果你还不清楚 **TP/PP/EP/DP 各切什么、Executor 与 Worker 的分工**，可先扫一眼 [PRIMER §2.4](../PRIMER.md#24-易混概念对照区别与联系专治听过但分不清) 的并行维度对照表，这里默认你已经有了那套心智模型。
+
+### 1.1 这个模块在系统里的位置
+
+本模块解决的是"**一张卡放不下/算不快时怎么办**"——把模型切到多卡多机，并让上层调度毫无感知：
+
+- **上游**：调度器（[模块 01](../01-scheduler-batching/design.md)）每步产出一个 `SchedulerOutput`，只管"算什么"，不管"在几张卡上算"。
+- **本模块**：通过 **Executor** 把这一步执行**下发**到一个或多个 **Worker**；同时实现四种并行策略——把权重（TP）、层（PP）、MoE 专家（EP）切开，或把整个引擎复制多份（DP），并在各处插入所需的集合通信（all-reduce / send-recv / all-to-all）。
+- **下游**：每个 Worker 在自己那张卡上跑模型分片的 forward（[模块 00](../00-request-lifecycle/impl.md) 的 GPUModelRunner），结果汇总回后端。
+
+一句话：**它是把"一个 `step()`"透明地扩展到单卡 / 多卡 / 多机的"接缝层"——换并行策略 = 换 Executor，调度与模型代码不动。**
+
+### 1.2 关键文件与类各干什么（先认人）
+
+| 文件 / 类 | 主要作用（一句话） |
+|---|---|
+| `distributed/parallel_state.py` 的 `GroupCoordinator` | 一个进程组的**通信门面**：持 NCCL group + gloo group + 通信器，封装 all-reduce/all-gather/send/recv |
+| `distributed/parallel_state.py` 的 `initialize_model_parallel` | 把 world 个 rank reshape 成 `ExternalDP×DP×PP×TP` 四维网格，建 `_TP/_PP/_DP` 组 |
+| `model_executor/layers/linear.py` 的 `ColumnParallelLinear`/`RowParallelLinear`/`QKVParallelLinear` | TP 的**列并行/行并行/QKV 切分**线性层（权重沿不同维切、在必要处通信） |
+| `model_executor/layers/fused_moe/layer.py` 的 `FusedMoE` | MoE 层，含 `ep_size`/`expert_map`，在 **TP-on-MoE 与 EP** 间切换 |
+| `sequence.py` 的 `IntermediateTensors` | PP 段间传递的 `{hidden_states, residual}` 载荷 |
+| `v1/executor/multiproc_executor.py` 的 `MultiprocExecutor` | 多进程 TP 执行后端（V1 当前 `world_size==tp_size`） |
+| `v1/executor/ray_distributed_executor.py` 的 `RayDistributedExecutor` | 支持 PP 的执行后端（用 Ray compiled DAG 流过各 stage） |
+| `v1/engine/core.py` 的 `DPEngineCoreProc` | DP 专用的 EngineCore 进程：finish 同步、空闲时跑 dummy batch |
+
+### 1.3 和相似模块 / 概念的区别与联系（专治"听过但分不清"）
+
+- **TP vs PP vs EP vs DP**：四个**正交**维度，可任意叠加。TP=切每一层的矩阵（高频 all-reduce、最吃带宽）；PP=按层切成段（段间只传一次中间张量、对跨节点带宽不敏感）；EP=把 MoE 的整个专家分到不同卡；DP=把整个引擎复制多份各喂不同请求。**前三者切的是"一个模型实例"，DP 复制的是"整个实例"**（见 §3、[PRIMER §2.4](../PRIMER.md#24-易混概念对照区别与联系专治听过但分不清)）。
+- **Executor vs Worker**：**下发者 vs 干活者**。`Executor`（本进程或 Ray）把"执行一步"广播/路由给若干 `Worker`；每个 `Worker` 在一张卡上跑模型分片的 forward。换单卡/多卡/多机 = 换 Executor 实现，Worker 侧逻辑基本不变。
+- **调度 vs 执行**：调度（[模块 01](../01-scheduler-batching/design.md)）只**动脑**产出 `SchedulerOutput`，不碰 GPU、不知道有几张卡；本模块的 Executor 才**动手**把它下发执行。正因调度产物是纯数据、与并行无关，才能"换并行不改调度"。
+- **EP vs TP-on-MoE**：同一批 GPU 上 MoE 的两种切法。TP-on-MoE=**切每个专家的矩阵**（所有 rank 都参与每个专家）；EP=**把不同专家放到不同 rank**（每 rank 只算自己的专家）。靠 `enable_expert_parallel` 一个开关切换（§3.3）。
+
+🔗 **回扣[贯穿示例](../PRIMER.md#第三部分一个贯穿全文的玩具示例强烈建议先看懂这个)**：那个 `[11,7,4]` 的例子是**单卡**跑的，不涉及任何并行通信。但可借它想象 TP=2 时会发生什么：例子里有 2 个注意力头，TP=2 下 QKVParallelLinear 会把它们按 head 切到两张卡，每卡只算 1 个头、只存这一半的 KV；attention 算完后经一次 all-reduce 把两卡的部分输出加回完整结果。其余 prefill/decode/采样的数据流与单卡完全一致。
+
+---
+
+### 1.4 这个模块要解决的问题
 
 LLM 推理在"单个 GPU"上会撞到两堵墙：
 

@@ -50,6 +50,8 @@
 
 ### 阶段 0：启动期 —— 两实例各自初始化 KV transfer
 
+> **这一步在干嘛**：两个 vLLM 实例启动时，各自照配置认领身份（一个当发送方 producer、一个当接收方 consumer），并把 KV 传输的管道（pipe）和缓冲区（buffer）按身份建好 —— producer 只建发送侧、consumer 只建接收侧，之后才能对接传 KV。
+
 **0a.** 启动参数（`examples/online_serving/disaggregated_prefill.sh:50-65`）：prefill 实例 `kv_role=kv_producer, kv_rank=0`，decode 实例 `kv_role=kv_consumer, kv_rank=1`，二者 `kv_parallel_size=2`，共享同一 `kv_ip:kv_port`。
 
 **0b.** `vllm/engine/arg_utils.py:941`
@@ -83,6 +85,8 @@ return connector_cls(rank, local_rank, config)
 ---
 
 ### 阶段 P：Prefill 实例算出 KV
+
+> **这一步在干嘛**：prefill 实例照常跑一遍前向，把整段 prompt 的 KV cache 算进 paged 显存；算完后判断"我是 producer 且这步是 prefill"，就把 batch 里每条请求的 KV 按请求/layer/物理 slot 三个维度切出来，连同 hidden states 一起塞进发送缓冲区，等 decode 实例来取。发送是非阻塞的，塞完就能去处理下一条请求。
 
 Proxy 把 `max_tokens=1` 的请求发给 prefill 实例（`disagg_prefill_proxy_server.py` 的 `prefill_request['max_tokens'] = 1`）。请求照常走 V0 生命周期到 model runner。
 
@@ -161,6 +165,8 @@ with self.buffer_cv:
 
 ### 阶段 T：跨实例传输（producer buffer ↔ consumer）
 
+> **这一步在干嘛**：producer 这边有个后台线程一直守着，等 consumer 通过信号管道发来"我要哪些 token 的 KV"的查询；收到后在缓冲区里做前缀匹配找到对应 KV，再经数据管道发回去。这一层就是把"先进先出的裸管道"翻译成"按内容查找"，从而容忍 prefill/decode 两边请求顺序不一致。
+
 **T1.** Producer 后台线程 `simple_buffer.py:135` `drop_select_handler`（阶段 P6 启动）
 ```python
 while True:
@@ -187,6 +193,8 @@ while True:
 ---
 
 ### 阶段 D：Decode 实例接收 KV 并续算
+
+> **这一步在干嘛**：decode 实例在跑前向之前先判断"我是 consumer 且这步是 prefill"，是就去 producer 那边把这条请求的 KV 查回来、写进自己本地的 paged 显存；只要 batch 里每条请求都完整命中，就置 `bypass_model_exec=True` **整段跳过 prefill 前向**，直接用收到的 hidden states 采样出第一个生成 token，之后这条请求就在本实例正常 decode。任一请求没查到 KV，则保守回退到正常前向重算。
 
 Proxy 把**原请求**（完整 `max_tokens`）发给 decode 实例。请求走 V0 生命周期，第一步是 prefill 步（因为 decode 实例还没有这条请求的 KV），进入 model runner。
 

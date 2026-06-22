@@ -5,7 +5,44 @@
 
 ---
 
-## 1. 这个模块解决什么问题
+## 1. 背景与定位
+
+> 如果你还不清楚 **tokenize/detokenize、前端/后端进程、continuous batching** 这些前置概念，请先读 [PRIMER](../PRIMER.md#第一部分llm-推理服务-101先建立心智模型)，这里默认你已经有了那套心智模型。
+
+### 1.1 这个模块在系统里的位置
+
+请求生命周期是整个引擎的**总骨架**——它不解决某一个具体技术点，而是把"一条请求从进门到出门"的编排串起来：
+
+- **上游**：用户从 HTTP（OpenAI server）或 `LLM.generate`（offline）把文本+采样参数丢进来。
+- **本模块**：前端进程把文本 **tokenize** 成 token id、打包成 `EngineCoreRequest`，跨进程送进 EngineCore 后端进程；后端跑 `schedule → execute → update` 主循环逐 token 生成；生成的 token 再跨进程回前端 **detokenize** 成文本。
+- **下游**：把每个新 token 流式（SSE）吐回客户端，直到命中结束符或长度上限。
+
+一句话：**它是把"收请求 → 调度（[模块 01](../01-scheduler-batching/design.md)）→ 管显存（[模块 02](../02-paged-attention-kvcache/design.md)）→ 分布式执行（[模块 03](../03-distributed-parallel/design.md)）→ 采样（[模块 06](../06-sampling-structured-output/design.md)）→ 出 token"这一整条流水线编排起来的进程与数据流模型。**
+
+### 1.2 关键文件与类各干什么（先认人）
+
+| 文件 / 类 | 主要作用（一句话） |
+|---|---|
+| `entrypoints/openai/serving_completion.py` / `entrypoints/llm.py` | 两个入口：online（异步 HTTP）/ offline（同步 `LLM.generate`） |
+| `v1/engine/async_llm.py` 的 `AsyncLLM` | **异步前端引擎**：收请求、跑唯一的 `output_handler` 后台 loop、把结果流式吐回 |
+| `v1/engine/llm_engine.py` 的 `LLMEngine` | **同步前端引擎**（offline 用）：主线程同步 step 循环，无 asyncio |
+| `v1/engine/processor.py` 的 `Processor` | 输入侧 CPU 重活：文本 **tokenize**、多模态预处理、参数校验 → 产出 `EngineCoreRequest` |
+| `v1/engine/output_processor.py` 的 `OutputProcessor` | 输出侧 CPU 重活：token **detokenize** 成文本、按 request_id 分发、stop string 检测 |
+| `v1/engine/core.py` 的 `EngineCore` / `EngineCoreProc` | **后端引擎进程**：独立进程里跑纯同步 `while True: step()` 主循环，独占 GPU 关键路径 |
+| `v1/engine/core_client.py` 的 `EngineCoreClient` | 前端侧的 IPC 门面：ZMQ socket + msgpack 序列化收发 |
+
+### 1.3 和相似模块 / 概念的区别与联系（专治"听过但分不清"）
+
+- **`AsyncLLM`（前端）vs `EngineCore`（后端）**：两者**在不同进程**。`AsyncLLM` 在 API server 进程里做 CPU 活（tokenize/detokenize/序列化），`EngineCore` 在独立后台进程里独占 GPU 关键路径——这是 V1 把"CPU 后处理"与"GPU 推理"进程级隔离、让 GPU 永不空转的核心结构（见 §3.1）。
+- **`Processor`（tokenize）vs `OutputProcessor`（detokenize）**：二者**互为反向**。`Processor` 把"用户文本 → token id"（进门方向），`OutputProcessor` 把"采样出的 token id → 文本"（出门方向）；两者都跑在前端进程，是关键路径之外的 CPU 活。
+- **同步 `LLMEngine` vs 异步 `AsyncLLM`**：offline 批量场景用 `LLMEngine`（主线程一个同步 step 循环），online 服务用 `AsyncLLM`（asyncio + 单一 `output_handler` 多路复用 N 条请求）。**二者共用同一套 `process_inputs → EngineCore.step → process_outputs` 三段**，只是驱动方式不同（见 [`impl.md`](impl.md) §3）。
+- **调度 vs 执行**：本模块的 `step()` 三段式里，`schedule()` 只**动脑**（决定算什么，见 [模块 01](../01-scheduler-batching/design.md)），`execute_model()` 才**动手**（去 GPU 算，见 [模块 03](../03-distributed-parallel/design.md)）。
+
+🔗 **回扣[贯穿示例](../PRIMER.md#第三部分一个贯穿全文的玩具示例强烈建议先看懂这个)**：例子里 prompt `[11,7,4]` 就是 `Processor` 在前端 tokenize 出来的 token id，打包进 `EngineCoreRequest` 过界送进 EngineCore；最后采样出的 token id=9 又经 `OutputProcessor` detokenize 成文本、流式吐回客户端——这一进一出正是本模块编排的两端。
+
+---
+
+### 1.4 这个模块要解决的问题
 
 一个 LLM 推理服务在"请求编排"层面要同时满足几组互相拉扯的诉求：
 

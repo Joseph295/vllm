@@ -51,6 +51,8 @@ config.py:2573                           # LoRAConfig
 
 ### 链路 A：加载 LoRA（add_lora）
 
+> **这一步在干嘛**：用户调 `add_lora` 时，把一个适配器从磁盘/HF 读进来、校验合法（rank 没超限、不是不支持的 DoRA 等），转成 `LoRAModel` 先驻留 CPU 缓存，再 `copy_` 进一个空闲的 GPU 槽位。CPU/GPU 缓存满了就按 LRU 驱逐最旧的。
+
 **A1.** `vllm/v1/engine/core.py:277` `EngineCore.add_lora()`
 ```python
 def add_lora(self, lora_request: LoRARequest) -> bool:
@@ -93,6 +95,8 @@ self._adapter_manager.activate_adapter(lora_request.lora_int_id)  # 同步搬到
 
 ### 链路 B：把基座层包装成 LoRA 层（启动期一次性）
 
+> **这一步在干嘛**：开机时一次性"改装"基座模型——把所有该挂 LoRA 的 Linear/Embedding/Logits 层换成 `*WithLoRA` 包装层，并按 `max_loras × max_lora_rank` 上限**预分配好 GPU stacked 权重张量**（全零待填）。之后激活适配器只往里 `copy_`、从不重新分配显存，这样地址固定、和 CUDA graph 兼容。
+
 **B1.** `vllm/v1/worker/gpu_model_runner.py:1280` 在模型加载后调
 `self.model = self.load_lora_model(self.model, model_config, scheduler_config, lora_config, device)`
 → `lora_model_runner_mixin.py:27` `LoRAModelRunnerMixin.load_lora_model()`：
@@ -133,6 +137,8 @@ self.lora_b_stacked = tuple(torch.zeros(max_loras, 1, lora_b_out_size, max_lora_
 至此基座模型的目标层已全部被 LoRA 包装层替换，GPU stacked 权重张量全零待填。
 
 ### 链路 C：每 batch 构建 mapping 并激活适配器
+
+> **这一步在干嘛**：每一步组好 batch 后，要告诉 kernel"第 i 个 token 该用哪个 LoRA"。先把"每请求一个 LoRA id"用 `np.repeat` 展开成"每 token 一个 id"，再把全局 `lora_int_id` 翻译成 0..max_loras-1 的 GPU 槽位下标（无 LoRA 标 -1），最后按 LoRA 把 token 排序、算出分段元数据喂给 Punica kernel。
 
 **C1.** `vllm/v1/worker/gpu_model_runner.py:613`（在 `_prepare_inputs` 内）
 ```python
@@ -221,6 +227,8 @@ lora_token_start_loc = torch.cumsum(num_tokens_per_lora) # 每 lora 段的起始
 > 这套元数据正是 SGMV/BGMV kernel 的输入：`active_lora_ids` 告诉 kernel "本步有哪些 LoRA"，`num_tokens_per_lora` + `lora_token_start_loc` 划出每个 LoRA 的 token 段，`token_indices_sorted_by_lora_ids` 让 kernel gather 出每段的原始 token 行。
 
 ### 链路 D：forward 时 punica 按请求选 adapter
+
+> **这一步在干嘛**：真正算的地方。每个被适配层先跑**基座大 GEMM**（全 batch 共享 `W`、只算一遍），再用 Punica kernel 分两步算 LoRA 增量——`shrink`（`x·A`，把 hidden 压到 rank）和 `expand`（`·B`，还原到 out 并**原地加回基座输出**）。kernel 在 grid 的一维上并行各 LoRA，无 LoRA 的 token（id=-1）直接早退，一次 launch 算完全 batch、全 LoRA。
 
 **D1.** `gpu_model_runner.py` 模型 forward 中，每个被适配的 Linear 层走它的 `forward`。以 `ColumnParallelLinearWithLoRA.forward`（`layers.py:554`）为例：
 ```python

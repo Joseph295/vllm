@@ -6,7 +6,45 @@
 
 ---
 
-## 1. 这个模块解决什么问题
+## 1. 背景与定位
+
+> 读之前最好先有这个心智模型：**MoE = 模型参数很多，但每个 token 只走其中少数几个「专家」**——参数多≠每 token 算得多。这条对照见 [PRIMER §2.4「MoE vs 稠密模型」](../PRIMER.md#24-易混概念对照区别与联系专治听过但分不清)。本模块讲 vLLM 怎么把这套「稀疏路由」高效地跑在 GPU 上。
+
+### 1.1 这个模块在系统里的位置
+
+MoE 不是引擎骨架的一环，而是**模型架构技术**——它替换的是 Transformer 里的 FFN/MLP 层。在 [PRIMER §2.1](../PRIMER.md#21-两条-track先分清骨架和血肉) 的两条 track 里，它属于「模型架构技术」这条（垂直、随模型而异），和调度/KV/分布式那条「引擎骨架」正交：
+
+- **上游**：attention 算完、`hidden_states` 出来，本该过一个稠密 MLP；MoE 模型在这里换成「router 先选专家 + 只走选中的专家」。
+- **本模块**：router 门控（选哪几个专家）→ 把变长的「每专家 token 数」对齐成规整的 grouped GEMM → 两段专家 GEMM 夹一个激活 → 把每 token 的 top-k 专家输出加权求和。
+- **下游**：算完的 `hidden_states` 接回 decoder 的下一层，对 attention / KV cache（[模块 02](../02-paged-attention-kvcache/design.md)）而言 MoE 层和普通 MLP 层没区别——它只是「这一层 FFN 怎么算」的内部实现。
+
+一句话：**MoE 把「过一个大 MLP」换成「router 选少数专家、只算这几个专家」，本模块解决的是「数据相关的稀疏路由，怎么变成 GPU 能批量吃的规整 grouped GEMM」。**
+
+### 1.2 关键文件与类各干什么（先认人）
+
+| 文件 / 符号 | 主要作用（一句话） |
+|---|---|
+| `fused_moe/layer.py` 的 `FusedMoE` | MoE 层 nn.Module：持专家权重、`expert_map`、quant_method；统一 `select_experts` 入口；EP↔TP 切换 |
+| `fused_moe/layer.py` 的 `FusedMoEMethodBase` | 量化方法抽象基类，各量化方案（fp8/int8/marlin…）派生，决定权重布局和走哪个后端 |
+| `fused_moe/fused_moe.py` 的 `fused_topk` / `grouped_topk` | 路由：算每个 token 去哪 top-k 个专家、对应门控权重 |
+| `fused_moe/moe_align_block_size.py` 的 `moe_align_block_size` | **题眼**：把变长的「每专家 token 列表」排序+padding 成规整分块，产出 `sorted_token_ids`/`expert_ids` |
+| `fused_moe/fused_moe.py` 的 `fused_moe_kernel` | 融合 triton grouped GEMM：用 `expert_ids[block]` 切换权重矩阵，一次 launch 算完所有专家 |
+| `fused_moe/fused_moe.py` 的 `fused_experts_impl` | 两段 grouped GEMM 夹 `silu_and_mul` 的主循环 + 中间 cache 复用 |
+| `layer.py` 的 `determine_expert_map` | EP 下产出 `expert_map`：全局专家 id → 本地 id，非本卡为 -1 |
+| `cutlass_moe.py` / `deep_gemm_moe.py` / `fused_marlin_moe.py` | 其它 grouped GEMM 后端（CUTLASS fp8 / DeepGEMM fp8 / Marlin int4） |
+
+### 1.3 和相似模块 / 概念的区别与联系（专治"听过但分不清"）
+
+- **MoE vs 稠密模型**：稠密模型每个 token 都过**全部** FFN 参数；MoE 把一个大 FFN 拆成 N 个「专家」（每个是小 FFN），每个 token 只走 router 选中的 top-k 个。结果：**总参数量大（容量高），但每 token 的 FLOPs 小**。Mixtral-8x7B 就是「参数像 47B、算力像 13B」。MoE 不改 attention/KV，只改「FFN 这一层怎么算」。
+- **路由 top-k vs 全激活**：稠密 = 全激活（所有参数都参与每个 token）；MoE 路由 = 一个小 Linear（router/gate）当场算出每个 token 的「专家偏好分数」，只激活分数最高的 k 个专家。路由是**数据相关、运行时才定**的——这正是后面所有麻烦的根源（每个专家实际分到多少 token 编译期不知道、且各不相同）。
+- **grouped GEMM vs 普通 GEMM**：普通 GEMM 是一个 `[M,K]×[K,N]` 的稠密矩阵乘；**grouped GEMM** 是「一批形状/权重各异的小 GEMM 合成一次 kernel」——MoE 里就是「专家 A 的 37 个 token 用 A 的权重、专家 B 的 5 个 token 用 B 的权重……」。难点在这些「每专家 token 数」是变长的（ragged），喂不进规整 kernel——所以要先用 `moe_align_block_size` 排序+padding 对齐（§3.2），这是整个模块的题眼。
+- **EP vs 单卡专家**：专家少时所有专家放一张卡，grouped GEMM 一把算完（可叠加 TP 切每个专家的矩阵）。专家多到单卡放不下（如 DeepSeek-V3 的 256 专家）时走 **EP（专家并行）**：把**整个专家**分到不同卡，每卡只持有一部分专家的完整权重。vLLM 巧妙地让同一个融合 kernel 既跑单卡也跑 EP——靠 `expert_map` 把「不在本卡的专家」映射成 -1、kernel 见 -1 就输出写 0（§3.4）。EP 作为并行维度怎么和 TP/PP/DP 组合见 [模块 03](../03-distributed-parallel/design.md)，本模块只讲「`expert_map` 怎么让本地 kernel 跳过非本卡专家」。
+
+> 贯穿示例（[PRIMER 第三部分](../PRIMER.md#第三部分一个贯穿全文的玩具示例强烈建议先看懂这个)）用的是**稠密**玩具模型，没有 MoE 层，故本模块一般不回扣它。只需记住：示例里 attention 之后那一步「过 MLP」，如果换成 MoE 模型，就会变成「router 先从一堆专家里挑几个、只让这个 token 过这几个专家」——参数虽多，但这个 token 真正算到的还是少数几个小 MLP。
+
+---
+
+### 1.4 这个模块要解决的问题
 
 MoE 的核心命题是 **稀疏激活（sparse activation）**：让模型 **总参数量很大**（容量高、知识多），但 **每个 token 只激活其中一小部分参数**（计算量低）。
 

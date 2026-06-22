@@ -46,6 +46,10 @@ V0 对比 vllm/core/
 
 ### 阶段 A：调度器请求 block —— prefix 命中 + 分配
 
+> **这一步在干嘛**：调度器要给一个请求安排 KV 空间。先问 prefix cache"前面这段 token 有没有别人/自己已经算过"——命中的部分直接白嫖（不再计算），只为剩下的 token 真正申请新物理块。这是 prefix caching 省算力和 PagedAttention 分配显存的入口。
+>
+> 🔗 **回扣[贯穿示例](../PRIMER.md#第三部分一个贯穿全文的玩具示例强烈建议先看懂这个)**：例子里 `[11,7,4]` 若是全新请求，prefix 不命中，就为 2 个逻辑块申请物理块 `[7,3]`；若另一条请求前缀也是 `[11,7]`，它会命中物理块 7、直接共享，省去重算。
+
 **A1.** `vllm/v1/core/sched/scheduler.py:305` 调度 WAITING 请求时，先查 prefix cache：
 ```python
 computed_blocks, num_computed_tokens = \
@@ -168,6 +172,10 @@ for i, blk in enumerate(new_full_blocks):
 
 ### 阶段 B：worker 侧 —— 维护 block table 张量、算 slot_mapping
 
+> **这一步在干嘛**：调度器分到的物理块号过界到 worker 后，把它们写进 GPU 上的 block table 张量（这条请求的"逻辑块→物理块"页表）；再为本步要算的每个 token 算出它的全局 **slot**（= 物理块号×block_size + 块内偏移），告诉 kernel"这个 token 的 KV 该写到显存哪个槽位"。
+>
+> 🔗 **回扣[贯穿示例](../PRIMER.md#第三部分一个贯穿全文的玩具示例强烈建议先看懂这个)**：这一步就是算出例子里的 `slot_mapping = [14, 15, 6]`（token0→7×2+0=14、token1→7×2+1=15、token2→3×2+0=6）。
+
 **B1.** `vllm/v1/worker/gpu_model_runner.py:420` `_update_states()`：把新分到的 block_id 追加进 GPU block table 行
 ```python
 self.input_batch.block_table.append_row(req_data.new_block_ids, req_index)
@@ -194,6 +202,8 @@ np.add(block_numbers * self.block_size, block_offsets,
 
 ### 阶段 C：attention backend —— 把 block_table / slot_mapping 装进 metadata
 
+> **这一步在干嘛**：把上一步算好的 `block_table`、`slot_mapping`、各请求序列长度等，打包成 attention kernel 一步所需的元数据 `FlashAttentionMetadata`——这就是交给 kernel 的"寻址说明书"。
+
 **C1.** `vllm/v1/attention/backends/flash_attn.py:286` `FlashAttentionMetadataBuilder.build()`
 ```python
 block_table = self.runner.input_batch.block_table.get_device_tensor()[:num_reqs]
@@ -205,6 +215,10 @@ attn_metadata = FlashAttentionMetadata(... block_table=block_table, slot_mapping
 > `FlashAttentionMetadata`（`:71`）就是 attention 一步所需的全部 paged 元数据。`use_cascade`（`:321`）用于公共前缀的 cascade attention（见 §3）。
 
 ### 阶段 D：写 KV —— reshape_and_cache_flash
+
+> **这一步在干嘛**：把本步算出的新 token 的 K、V 写进分页 KV cache。kernel 拿 `slot_mapping` 里每个 token 的 slot，反解出"物理块号 + 块内偏移"，把 K/V 放到显存对应地址——这就是"逻辑位置→物理槽位"的写入落地。
+>
+> 🔗 **回扣[贯穿示例](../PRIMER.md#第三部分一个贯穿全文的玩具示例强烈建议先看懂这个)**：例子里 token2 的 slot=6 在这里被分解回 `block_idx = 6/2 = 3`、`block_offset = 6%2 = 0`，于是 k2/v2 被写进物理块 3 的偏移 0。
 
 **D1.** `vllm/v1/attention/backends/flash_attn.py:460` `forward()` 先把本步算出的 K/V 写进 paged cache：
 ```python
@@ -230,6 +244,10 @@ const int64_t tgt_key_idx =
 > design §3.1 的 `slot = physical_block*block_size + offset` 在这里被**逆向**分解回 `(block_idx, block_offset)` 来定位 cache 张量地址。`slot_idx < 0` 是 padding 的哨兵值。
 
 ### 阶段 E：读 KV —— attention kernel 用 block table 逻辑→物理寻址
+
+> **这一步在干嘛**：算 attention 时，当前 token 的 query 要去读前面所有 token 的 K/V。但 KV 散落在不连续的物理块里，kernel 必须用 `block_table[逻辑块] → 物理块` 跳着读——这一次间接寻址就是 PagedAttention 与朴素 attention 的全部区别。
+>
+> 🔗 **回扣[贯穿示例](../PRIMER.md#第三部分一个贯穿全文的玩具示例强烈建议先看懂这个)**：decode 步算 `q3` 对前 4 个位置的 attention 时，kernel 用 `block_table=[7,3]` 把逻辑位置翻成物理 slot——pos0/1 在物理块 7、pos2/3 在物理块 3——再去取对应 KV。
 
 **E1.** Python 侧（FlashAttention 路径）把 `block_table` 传给 `flash_attn_varlen_func`（`flash_attn.py:503-522`），kernel 内部按 block table 跳读 paged KV。
 
