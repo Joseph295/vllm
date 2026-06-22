@@ -19,7 +19,7 @@ LLM 推理在"单个 GPU"上会撞到两堵墙：
 |---|---|---|---|
 | **TP**（Tensor Parallel，张量并行） | **每一层的权重矩阵**沿行/列切 | 显存 + 单层算力 | 每层 1~2 次 all-reduce（**高频、在关键路径**） |
 | **PP**（Pipeline Parallel，流水线并行） | **按层**切，每段 GPU 放连续若干层 | 显存（跨段摊薄） | 段间 1 次 send/recv（**低频、点对点**） |
-| **EP**（Expert Parallel，专家并行） | MoE 的**整个专家**分到不同卡 | MoE 显存（专家极多时） | 每个 MoE 层 1 次 all-to-all / all-reduce |
+| **EP**（Expert Parallel，专家并行） | MoE 的**整个专家**分到不同卡（MoE 机制本身见 [模块 12](../12-moe/design.md)） | MoE 显存（专家极多时） | 每个 MoE 层 1 次 all-to-all / all-reduce |
 | **DP**（Data Parallel，数据并行） | **整个引擎复制多份**，各喂不同请求 | 吞吐（放得下但要更多并发） | 仅 finish 同步 + MoE 时的 token 重分布 |
 
 核心思想是：**TP/PP/EP 切的是"一个模型实例"，DP 复制的是"整个模型实例"**。前三者降低单实例的显存/延迟，DP 提高实例数从而提高吞吐。world 拓扑 `ExternalDP × DP × PP × TP` 把它们排成一个四维网格（见 §4.4）。

@@ -119,6 +119,11 @@ V0 = 遗留实现(legacy)，现在主要作为 fallback：请求了 V1 尚不支
 | 09 | **LoRA 多适配器** | `vllm/lora/` | [design](09-lora/design.md) · [impl](09-lora/impl.md) |
 | 10 | **Multimodal 多模态** | `vllm/multimodal/`、`v1/core/encoder_cache_manager.py` | [design](10-multimodal/design.md) · [impl](10-multimodal/impl.md) |
 | 11 | **GPU 执行底层：Kernel 与显存** —— 深入 csrc/ CUDA 源码 | `csrc/attention/`、`csrc/cache_kernels.cu`、`csrc/custom_all_reduce.cu`、`csrc/quantization/` | [design](11-gpu-kernels-memory/design.md) · [impl](11-gpu-kernels-memory/impl.md) |
+| — | **—— 模型架构技术 track（12~15）——** | 横向引擎之外的"模型/注意力变体"垂直技术 | |
+| 12 | **MoE 混合专家** —— 路由 / fused_moe / 分组 GEMM / EP | `model_executor/layers/fused_moe/`、`csrc/moe/` | [design](12-moe/design.md) · [impl](12-moe/impl.md) |
+| 13 | **MLA 潜在注意力（DeepSeek）** —— latent KV 压缩 / 吸收矩阵 | `v1/attention/backends/mla/` | [design](13-mla/design.md) · [impl](13-mla/impl.md) |
+| 14 | **注意力变体：SWA / Cascade / GQA·MQA** | `v1/core/specialized_manager.py`、`v1/attention/backends/` | [design](14-attention-variants/design.md) · [impl](14-attention-variants/impl.md) |
+| 15 | **Mamba/SSM 与混合架构 + 位置编码（RoPE/M-RoPE/YaRN）** | `model_executor/layers/mamba/`、`rotary_embedding.py` | [design](15-mamba-rope/design.md) · [impl](15-mamba-rope/impl.md) |
 
 ## 端到端全景图（一条请求如何穿过 11 个模块）
 
@@ -326,6 +331,12 @@ TP 与 PP 是两种正交的切法：**TP 把"每一层"横向切开（切矩阵
      ├─ CUDA graph 显存池 / stream    ◀── 07
      ├─ custom all-reduce GPU IPC     ◀── 03
      └─ 量化 GEMM（Marlin）kernel     ◀── 08
+
+   模型架构技术 track（垂直层，挂在 02/03/10 之上）：
+     ├─ 12 MoE 混合专家        ── 路由+分组 GEMM，与 03 的 EP 并行结合
+     ├─ 13 MLA 潜在注意力       ── 02 PagedAttention 的变体，latent KV 压缩
+     ├─ 14 注意力变体 SWA/Cascade/GQA ── 02 KV 管理 + 调度公共前缀(01) 的特化
+     └─ 15 Mamba/SSM + 位置编码  ── 常量状态替代 KV；RoPE/M-RoPE(10) 注入位置
 ```
 
 > 建议阅读顺序：先读 **00 总览**建立全局执行骨架，再按 `01 → 02 → 03` 打通"调度—显存—分布式"主干，按需阅读 04~10 的专题模块；想钻 GPU 底层 / CUDA kernel 则读 **11**。

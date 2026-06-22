@@ -141,7 +141,7 @@ ref_cnt == 0 且未 cache        →  纯空闲块
 | `BlockPool` | `block_pool.py:16` | 物理块总池：持有所有 `KVCacheBlock`、空闲链表、`cached_block_hash_to_block` 命中字典、`null_block` |
 | `cached_block_hash_to_block` | `block_pool.py:51` | `{block_hash: {block_id: block}}`，prefix cache 命中查找的核心字典 |
 | `KVCacheManager` | `kv_cache_manager.py:20` | 对调度器的门面：`allocate_slots` / `get_computed_blocks` / `free`；持有 `req_to_blocks`、`req_to_block_hashes` |
-| `SpecializedManager` | `specialized_manager.py:11` | 按 attention 类型分派的命中/驱逐逻辑：`FullAttentionManager` vs `SlidingWindowManager` |
+| `SpecializedManager` | `specialized_manager.py:11` | 按 attention 类型分派的命中/驱逐逻辑：`FullAttentionManager` vs `SlidingWindowManager`（SWA/Cascade 详见 [模块 14](../14-attention-variants/design.md)；MLA 详见 [模块 13](../13-mla/design.md)） |
 | `KVCacheSpec` / `FullAttentionSpec` / `SlidingWindowSpec` | `kv_cache_interface.py:15,73,85` | 描述一层 KV cache 的格式（block_size、num_kv_heads、head_size、dtype、page_size_bytes） |
 | `KVCacheConfig` / `KVCacheGroupSpec` | `kv_cache_interface.py:136,124` | 显存切分结果：`num_blocks`、每层张量大小、layer 分组 |
 | `BlockTable`（worker 侧） | `worker/block_table.py:11` | GPU 上的 block table 张量 `[max_num_reqs, max_num_blocks_per_req]`，喂给 attention kernel |
