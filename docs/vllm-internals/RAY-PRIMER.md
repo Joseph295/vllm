@@ -146,3 +146,5 @@ V1 的 `RayDistributedExecutor`（`vllm/v1/executor/ray_distributed_executor.py:
 5. Ray 相关概念（actor/ObjectRef/placement group）属 Ray 框架本身，**vLLM 只是使用者**——卡在 Ray API 时查 Ray 官方文档，卡在"vLLM 怎么用它"时回本篇。
 
 > 配套阅读：[模块 03](03-distributed-parallel/design.md)（四种并行 + Executor 抽象）、[PRIMER.md](PRIMER.md)（业务背景）、[PYTHON-PRIMER.md](PYTHON-PRIMER.md)（Python 语法）。
+>
+> 想**深入 Ray 内部、成为专家**（梳理 Ray 源码 + 一份 10–12 周可执行学习计划）见 [RAY-MASTERY.md](RAY-MASTERY.md)。
