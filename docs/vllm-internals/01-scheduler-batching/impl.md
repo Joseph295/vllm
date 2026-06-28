@@ -7,6 +7,24 @@
 
 ## 1. 代码地图
 
+> **一图看懂本模块的调用链**（节点 = 类/方法 + `file:line`；GitHub 会渲染成图）：
+
+```mermaid
+flowchart TD
+    Step["EngineCore.step()〔core.py:195〕"] --> Sched["Scheduler.schedule()〔scheduler.py:122〕"]
+    Sched --> Run{"① 遍历 RUNNING 队列〔:161〕"}
+    Run -->|"num_new_tokens = num_tokens_with_spec − num_computed_tokens"| Alloc["KVCacheManager.allocate_slots()〔:197〕"]
+    Alloc -->|放不下| Preempt["抢占最低优先级 running.pop()+free()〔:204〕"]
+    Alloc -->|放得下| Wait{"② 遍历 WAITING 队列〔:276〕"}
+    Preempt --> Wait
+    Wait -->|"get_computed_blocks() 查前缀命中"| Alloc2["allocate_slots()〔:332〕"]
+    Alloc2 --> Pack["打包 SchedulerOutput〔:404〕"]
+    Pack --> Adv["乐观推进 num_computed_tokens〔:455〕"]
+    Adv --> Exec["executor.execute_model()（GPU）"]
+    Exec --> Upd["③ Scheduler.update_from_output()〔:569〕：append token / check_stop / spec 回退"]
+    Upd -->|EngineCoreOutputs| Step
+```
+
 ```
 调度核心 v1/core/sched/
   ├─ scheduler.py        # Scheduler：schedule() / update_from_output() —— 本模块主体
